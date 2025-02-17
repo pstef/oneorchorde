@@ -372,13 +372,47 @@ static struct instruction decode_instruction(const uint8_t *code) {
             inst.name = "LD (HL-),A";
             inst.length = 1;
             break;
+        case 0x40: // LD B,B
+            inst.name = "LD B,B";
+            break;
+        case 0x41: // LD B,C
+            inst.name = "LD B,C";
+            break;
+        case 0x80: // ADD A,B
+            inst.name = "ADD A,B";
+            break;
+        case 0x81: // ADD A,C
+            inst.name = "ADD A,C";
+            break;
+        case 0x90: // SUB B
+            inst.name = "SUB B";
+            break;
+        case 0xA0: // AND B
+            inst.name = "AND B";
+            break;
+        case 0xB0: // OR B
+            inst.name = "OR B";
+            break;
+        case 0xF0: // LDH A,(a8)
+            inst.name = "LDH A,(a8)";
+            inst.length = 2;
+            break;
+        case 0xE0: // LDH (a8),A
+            inst.name = "LDH (a8),A";
+            inst.length = 2;
+            break;
+        case 0x2A: // LD A,(HL+)
+            inst.name = "LD A,(HL+)";
+            break;
+        case 0x22: // LD (HL+),A
+            inst.name = "LD (HL+),A";
+            break;
         default:
             inst.name = "Unknown";
             break;
     }
     return inst;
 }
-
 
 static bool translate_xor_a(struct translation_ctx *ctx) {
     // Get pointer to A register
@@ -479,6 +513,60 @@ static bool translate_ld_mem_a(struct translation_ctx *ctx, uint16_t addr) {
     return true;
 }
 
+
+static LLVMValueRef get_flag_mask(struct translation_ctx *ctx, uint8_t flag) {
+    return LLVMConstInt(ctx->i8_type, flag, false);
+}
+
+static bool translate_ldh_a8(struct translation_ctx *ctx, uint8_t offset, bool to_a) {
+    // High RAM access ($FF00 + offset)
+    uint16_t addr = 0xFF00 + offset;
+    
+    if (to_a) {
+        return translate_ld_a_mem(ctx, addr);
+    } else {
+        return translate_ld_mem_a(ctx, addr);
+    }
+}
+
+static bool translate_ld_hl_inc_a(struct translation_ctx *ctx, bool to_a) {
+    // Load current HL
+    LLVMValueRef hl_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 6, "hl_ptr");
+    LLVMValueRef hl = LLVMBuildLoad2(ctx->builder, ctx->i16_type, hl_ptr, "hl");
+
+    if (to_a) {
+        // LD A,(HL+)
+        // Read from memory
+        LLVMValueRef args[] = { hl };
+        LLVMValueRef val = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                       ctx->read_memory_fn, args, 1, "mem_val");
+        
+        // Store to A
+        LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                              ctx->cpu_state_ptr, 0, "a_ptr");
+        LLVMBuildStore(ctx->builder, val, a_ptr);
+    } else {
+        // LD (HL+),A
+        // Load A
+        LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                              ctx->cpu_state_ptr, 0, "a_ptr");
+        LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+
+        // Write to memory
+        LLVMValueRef args[] = { hl, a };
+        LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                     ctx->write_memory_fn, args, 2, "");
+    }
+
+    // Increment HL
+    LLVMValueRef new_hl = LLVMBuildAdd(ctx->builder, hl,
+        LLVMConstInt(ctx->i16_type, 1, false), "hl_inc");
+    LLVMBuildStore(ctx->builder, new_hl, hl_ptr);
+
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -507,8 +595,20 @@ static bool translate_instruction(struct translation_ctx *ctx,
             uint16_t addr = code[1] | (code[2] << 8);
             return translate_jp_a16(ctx, addr);
         }
+
+        case 0xF0:  // LDH A,(a8)
+            return translate_ldh_a8(ctx, code[1], true);
+
+        case 0xE0:  // LDH (a8),A
+            return translate_ldh_a8(ctx, code[1], false);
+
+        case 0x2A:  // LD A,(HL+)
+            return translate_ld_hl_inc_a(ctx, true);
+
+        case 0x22:  // LD (HL+),A
+            return translate_ld_hl_inc_a(ctx, false);
     }
-    
+
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);
     return false;
 }

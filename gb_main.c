@@ -248,7 +248,23 @@ static bool create_memory_interface(struct translation_ctx *ctx) {
     ctx->i8_type = LLVMInt8TypeInContext(ctx->ctx);
     ctx->i16_type = LLVMInt16TypeInContext(ctx->ctx);
     ctx->void_type = LLVMVoidTypeInContext(ctx->ctx);
-    
+
+    // Create CPU state type
+    LLVMTypeRef field_types[] = {
+        ctx->i8_type,  // a
+        ctx->i8_type,  // f
+        ctx->i8_type,  // b
+        ctx->i8_type,  // c
+        ctx->i8_type,  // d
+        ctx->i8_type,  // e
+        ctx->i8_type,  // h
+        ctx->i8_type,  // l
+        ctx->i16_type, // sp
+        ctx->i16_type  // pc
+    };
+    ctx->cpu_state_type = LLVMStructCreateNamed(ctx->ctx, "gb_cpu_state");
+    LLVMStructSetBody(ctx->cpu_state_type, field_types, 10, false);
+
     // Create read_memory function type: uint8_t(uint16_t)
     LLVMTypeRef read_params[] = { ctx->i16_type };
     ctx->read_memory_type = LLVMFunctionType(ctx->i8_type, read_params, 1, false);
@@ -516,6 +532,7 @@ static bool test_translation_and_run(struct translation_ctx *ctx) {
         return false;
     }
     
+    // Create thread-safe module - only takes module and context
     LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(
         ctx->module, tsctx);
     if (!tsm) {

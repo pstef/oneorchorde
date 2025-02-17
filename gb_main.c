@@ -474,6 +474,30 @@ static struct instruction decode_instruction(const uint8_t *code) {
             inst.name = "CALL a16";
             inst.length = 3;
             break;
+        case 0xC7: // RST 00H
+            inst.name = "RST 00H";
+            break;
+        case 0xCF: // RST 08H
+            inst.name = "RST 08H";
+            break;
+        case 0xD7: // RST 10H
+            inst.name = "RST 10H";
+            break;
+        case 0xDF: // RST 18H
+            inst.name = "RST 18H";
+            break;
+        case 0xE7: // RST 20H
+            inst.name = "RST 20H";
+            break;
+        case 0xEF: // RST 28H
+            inst.name = "RST 28H";
+            break;
+        case 0xF7: // RST 30H
+            inst.name = "RST 30H";
+            break;
+        case 0xFF: // RST 38H
+            inst.name = "RST 38H";
+            break;
         default:
             inst.name = "Unknown";
             break;
@@ -941,6 +965,56 @@ static bool translate_call(struct translation_ctx *ctx, const uint8_t *code, boo
     return true;
 }
 
+static bool translate_rst(struct translation_ctx *ctx, uint8_t vector) {
+    // RST pushes current PC and jumps to a fixed address
+    uint16_t target_addr = vector;
+    
+    // Get SP
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMValueRef sp = LLVMBuildLoad2(ctx->builder, ctx->i16_type, sp_ptr, "sp");
+    
+    // For RST, return address is just current PC + 1 (RST is 1 byte)
+    uint16_t return_addr = target_addr + 1;
+    
+    // Push return address (high byte first)
+    LLVMValueRef new_sp = LLVMBuildSub(ctx->builder, sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_dec");
+    
+    // Push high byte
+    LLVMValueRef args1[] = { 
+        new_sp,
+        LLVMConstInt(ctx->i8_type, (return_addr >> 8) & 0xFF, false)
+    };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                   ctx->write_memory_fn, args1, 2, "");
+    
+    // Push low byte
+    new_sp = LLVMBuildSub(ctx->builder, new_sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_dec2");
+    
+    LLVMValueRef args2[] = {
+        new_sp,
+        LLVMConstInt(ctx->i8_type, return_addr & 0xFF, false)
+    };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                   ctx->write_memory_fn, args2, 2, "");
+    
+    // Update SP
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    // Create target block and branch to it
+    char block_name[32];
+    snprintf(block_name, sizeof(block_name), "rst_%02X", vector);
+    LLVMBasicBlockRef target_block = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    LLVMBuildBr(ctx->builder, target_block);
+    
+    // Position at new block
+    LLVMPositionBuilderAtEnd(ctx->builder, target_block);
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -1014,6 +1088,22 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_call(ctx, code, true, true);
         case 0xCD:  // CALL a16
             return translate_call(ctx, code, false, false);
+        case 0xC7:  // RST 00H
+            return translate_rst(ctx, 0x00);
+        case 0xCF:  // RST 08H
+            return translate_rst(ctx, 0x08);
+        case 0xD7:  // RST 10H
+            return translate_rst(ctx, 0x10);
+        case 0xDF:  // RST 18H
+            return translate_rst(ctx, 0x18);
+        case 0xE7:  // RST 20H
+            return translate_rst(ctx, 0x20);
+        case 0xEF:  // RST 28H
+            return translate_rst(ctx, 0x28);
+        case 0xF7:  // RST 30H
+            return translate_rst(ctx, 0x30);
+        case 0xFF:  // RST 38H
+            return translate_rst(ctx, 0x38);
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

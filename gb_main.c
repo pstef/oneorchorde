@@ -453,6 +453,15 @@ static struct instruction decode_instruction(const uint8_t *code) {
         case 0xF1: // POP AF
             inst.name = "POP AF";
             break;
+        case 0xC0: // RET NZ
+            inst.name = "RET NZ";
+            break;
+        case 0xC8: // RET Z
+            inst.name = "RET Z";
+            break;
+        case 0xC9: // RET
+            inst.name = "RET";
+            break;
         default:
             inst.name = "Unknown";
             break;
@@ -759,6 +768,84 @@ static bool translate_pop_rr(struct translation_ctx *ctx, int hi_idx, int lo_idx
     return true;
 }
 
+static bool translate_ret(struct translation_ctx *ctx, bool conditional, bool condition) {
+    // For conditional RET, we need to check the Z flag
+    LLVMBasicBlockRef ret_block = NULL;
+    LLVMBasicBlockRef continue_block = NULL;
+    
+    if (conditional) {
+        // Create blocks for the conditional
+        ret_block = LLVMAppendBasicBlock(ctx->current_function, "ret");
+        continue_block = LLVMAppendBasicBlock(ctx->current_function, "ret_continue");
+        
+        // Get Z flag
+        LLVMValueRef z_flag = get_flag_z(ctx);
+        
+        // Compare with zero (for NZ) or non-zero (for Z)
+        LLVMValueRef cond;
+        if (condition) { // RET Z
+            cond = LLVMBuildICmp(ctx->builder, LLVMIntNE,
+                z_flag, LLVMConstInt(ctx->i8_type, 0, false), "z_check");
+        } else { // RET NZ
+            cond = LLVMBuildICmp(ctx->builder, LLVMIntEQ,
+                z_flag, LLVMConstInt(ctx->i8_type, 0, false), "nz_check");
+        }
+        
+        LLVMBuildCondBr(ctx->builder, cond, ret_block, continue_block);
+        
+        // Position at ret block
+        LLVMPositionBuilderAtEnd(ctx->builder, ret_block);
+    }
+    
+    // Load SP
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMValueRef sp = LLVMBuildLoad2(ctx->builder, ctx->i16_type, sp_ptr, "sp");
+    
+    // Read return address (low byte first)
+    LLVMValueRef args1[] = { sp };
+    LLVMValueRef pcl = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                     ctx->read_memory_fn, args1, 1, "pcl");
+    
+    // Increment SP and read high byte
+    LLVMValueRef new_sp = LLVMBuildAdd(ctx->builder, sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_inc");
+    
+    LLVMValueRef args2[] = { new_sp };
+    LLVMValueRef pch = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                     ctx->read_memory_fn, args2, 1, "pch");
+    
+    // Increment SP again
+    new_sp = LLVMBuildAdd(ctx->builder, new_sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_inc2");
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    // Combine into 16-bit address
+    LLVMValueRef ret_addr = LLVMBuildOr(ctx->builder,
+        LLVMBuildShl(ctx->builder, pch, LLVMConstInt(ctx->i16_type, 8, false), "pch_shifted"),
+        LLVMBuildZExt(ctx->builder, pcl, ctx->i16_type, "pcl_ext"),
+        "ret_addr");
+    
+    // Create a new basic block for the return target
+    char block_name[32];
+    snprintf(block_name, sizeof(block_name), "ret_%04X", 0); // We don't know the actual address yet
+    LLVMBasicBlockRef target_block = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    
+    // Branch to the target
+    LLVMBuildBr(ctx->builder, target_block);
+    
+    if (conditional) {
+        // Position at continue block and create branch
+        LLVMPositionBuilderAtEnd(ctx->builder, continue_block);
+        LLVMBuildBr(ctx->builder, target_block);
+    }
+    
+    // Position at new block
+    LLVMPositionBuilderAtEnd(ctx->builder, target_block);
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -820,6 +907,12 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_pop_rr(ctx, 6, 7);  // H = 6, L = 7
         case 0xF1:  // POP AF
             return translate_pop_rr(ctx, 0, 1);  // A = 0, F = 1
+        case 0xC0:  // RET NZ
+            return translate_ret(ctx, true, false);
+        case 0xC8:  // RET Z
+            return translate_ret(ctx, true, true);
+        case 0xC9:  // RET
+            return translate_ret(ctx, false, false);
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

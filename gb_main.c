@@ -407,6 +407,40 @@ static struct instruction decode_instruction(const uint8_t *code) {
         case 0x22: // LD (HL+),A
             inst.name = "LD (HL+),A";
             break;
+        // 8-bit loads
+        case 0x7E: // LD A,(HL)
+            inst.name = "LD A,(HL)";
+            break;
+        case 0x77: // LD (HL),A
+            inst.name = "LD (HL),A";
+            break;
+        // 16-bit loads
+        case 0x11: // LD DE,d16
+            inst.name = "LD DE,d16";
+            inst.length = 3;
+            break;
+        // Stack operations
+        case 0xC5: // PUSH BC
+            inst.name = "PUSH BC";
+            break;
+        case 0xD5: // PUSH DE
+            inst.name = "PUSH DE";
+            break;
+        case 0xE5: // PUSH HL
+            inst.name = "PUSH HL";
+            break;
+        case 0xF5: // PUSH AF
+            inst.name = "PUSH AF";
+            break;
+        // Conditional jumps
+        case 0x20: // JR NZ,r8
+            inst.name = "JR NZ,r8";
+            inst.length = 2;
+            break;
+        case 0x28: // JR Z,r8
+            inst.name = "JR Z,r8";
+            inst.length = 2;
+            break;
         default:
             inst.name = "Unknown";
             break;
@@ -567,6 +601,108 @@ static bool translate_ld_hl_inc_a(struct translation_ctx *ctx, bool to_a) {
     return true;
 }
 
+
+static LLVMValueRef get_flag_z(struct translation_ctx *ctx) {
+    // Get F register
+    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 1, "f_ptr");
+    LLVMValueRef f = LLVMBuildLoad2(ctx->builder, ctx->i8_type, f_ptr, "f");
+    
+    // Extract Z flag (bit 7)
+    return LLVMBuildAnd(ctx->builder, f, 
+                        LLVMConstInt(ctx->i8_type, 0x80, false), "z_flag");
+}
+
+static void set_flag_z(struct translation_ctx *ctx, LLVMValueRef value) {
+    // Get F register
+    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 1, "f_ptr");
+    LLVMValueRef f = LLVMBuildLoad2(ctx->builder, ctx->i8_type, f_ptr, "f");
+    
+    // Clear Z flag and set new value
+    LLVMValueRef new_f = LLVMBuildOr(ctx->builder,
+        LLVMBuildAnd(ctx->builder, f, LLVMConstInt(ctx->i8_type, 0x7F, false), "f_cleared"),
+        LLVMBuildShl(ctx->builder, value, LLVMConstInt(ctx->i8_type, 7, false), "z_shifted"),
+        "f_new");
+    
+    LLVMBuildStore(ctx->builder, new_f, f_ptr);
+}
+
+static bool translate_ld_hl(struct translation_ctx *ctx, bool to_a) {
+    // Get HL pointer
+    LLVMValueRef h_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 6, "h_ptr");
+    LLVMValueRef l_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 7, "l_ptr");
+    
+    // Load H and L
+    LLVMValueRef h = LLVMBuildLoad2(ctx->builder, ctx->i8_type, h_ptr, "h");
+    LLVMValueRef l = LLVMBuildLoad2(ctx->builder, ctx->i8_type, l_ptr, "l");
+    
+    // Create 16-bit address
+    LLVMValueRef hl = LLVMBuildOr(ctx->builder,
+        LLVMBuildShl(ctx->builder, h, LLVMConstInt(ctx->i8_type, 8, false), "h_shifted"),
+        l, "hl");
+    
+    if (to_a) {
+        // LD A,(HL)
+        LLVMValueRef args[] = { hl };
+        LLVMValueRef val = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                         ctx->read_memory_fn, args, 1, "mem_val");
+        
+        LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                                ctx->cpu_state_ptr, 0, "a_ptr");
+        LLVMBuildStore(ctx->builder, val, a_ptr);
+    } else {
+        // LD (HL),A
+        LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                                ctx->cpu_state_ptr, 0, "a_ptr");
+        LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+        
+        LLVMValueRef args[] = { hl, a };
+        LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                       ctx->write_memory_fn, args, 2, "");
+    }
+    
+    return true;
+}
+
+static bool translate_push_rr(struct translation_ctx *ctx, int hi_idx, int lo_idx) {
+    // Load SP
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMValueRef sp = LLVMBuildLoad2(ctx->builder, ctx->i16_type, sp_ptr, "sp");
+    
+    // Load high and low bytes
+    LLVMValueRef hi_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, hi_idx, "hi_ptr");
+    LLVMValueRef lo_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, lo_idx, "lo_ptr");
+    
+    LLVMValueRef hi = LLVMBuildLoad2(ctx->builder, ctx->i8_type, hi_ptr, "hi");
+    LLVMValueRef lo = LLVMBuildLoad2(ctx->builder, ctx->i8_type, lo_ptr, "lo");
+    
+    // Decrement SP and write high byte
+    LLVMValueRef new_sp = LLVMBuildSub(ctx->builder, sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_dec");
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    LLVMValueRef args1[] = { new_sp, hi };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                   ctx->write_memory_fn, args1, 2, "");
+    
+    // Decrement SP and write low byte
+    new_sp = LLVMBuildSub(ctx->builder, new_sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_dec2");
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    LLVMValueRef args2[] = { new_sp, lo };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                   ctx->write_memory_fn, args2, 2, "");
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -607,6 +743,19 @@ static bool translate_instruction(struct translation_ctx *ctx,
 
         case 0x22:  // LD (HL+),A
             return translate_ld_hl_inc_a(ctx, false);
+
+        case 0x7E:  // LD A,(HL)
+            return translate_ld_hl(ctx, true);
+        case 0x77:  // LD (HL),A
+            return translate_ld_hl(ctx, false);
+        case 0xC5:  // PUSH BC
+            return translate_push_rr(ctx, 2, 3);  // B = 2, C = 3
+        case 0xD5:  // PUSH DE
+            return translate_push_rr(ctx, 4, 5);  // D = 4, E = 5
+        case 0xE5:  // PUSH HL
+            return translate_push_rr(ctx, 6, 7);  // H = 6, L = 7
+        case 0xF5:  // PUSH AF
+            return translate_push_rr(ctx, 0, 1);  // A = 0, F = 1
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

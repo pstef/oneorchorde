@@ -58,14 +58,13 @@ int main(void) {
     rom[0x14E] = 0x00;
     rom[0x14F] = 0x00;
 
-    // Test code at 0x150 (after Nintendo header)
-    const unsigned char code[] = {
-        0x3E, 0x42,  // LD A,0x42    ; Load 0x42 into A
-        0x06, 0x17,  // LD B,0x17    ; Load 0x17 into B
-        0x00,        // NOP
-        0x18, 0xFD   // JR -3        ; Jump back to NOP (infinite loop)
+    // Test code at 0x150
+    const unsigned char test_code[] = {
+        0x3E, 0x42,  // LD A,0x42    ; Load test value into A
+        0x06, 0x17,  // LD B,0x17    ; Load test value into B
+        0xC3, 0x50, 0x01  // JP 0x0150  ; Loop forever
     };
-    memcpy(rom + 0x150, code, sizeof(code));
+    memcpy(rom + 0x150, test_code, sizeof(test_code));
 
     // Write complete ROM
     if (fwrite(rom, 1, sizeof(rom), f) != sizeof(rom)) {

@@ -319,6 +319,21 @@ static struct instruction decode_instruction(const uint8_t *code) {
     return inst;
 }
 
+static bool translate_jp_a16(struct translation_ctx *ctx, uint16_t addr) {
+    // Create a new basic block for the jump target
+    char block_name[32];
+    snprintf(block_name, sizeof(block_name), "addr_%04X", addr);
+    LLVMBasicBlockRef target_block = LLVMAppendBasicBlock(ctx->current_function, block_name);
+
+    // Jump to the target block
+    LLVMBuildBr(ctx->builder, target_block);
+
+    // Position builder at the new block
+    LLVMPositionBuilderAtEnd(ctx->builder, target_block);
+
+    return true;
+}
+
 // Generate LLVM IR for loading a register with an immediate value
 static bool translate_ld_r_d8(struct translation_ctx *ctx, uint8_t reg_idx, uint8_t value) {
     // Get pointer to register in CPU state
@@ -383,6 +398,11 @@ static bool translate_instruction(struct translation_ctx *ctx,
         case 0xEA: { // LD (a16),A
             uint16_t addr = code[1] | (code[2] << 8);
             return translate_ld_mem_a(ctx, addr);
+        }
+
+        case 0xC3: { // JP a16
+            uint16_t addr = code[1] | (code[2] << 8);
+            return translate_jp_a16(ctx, addr);
         }
     }
     

@@ -48,6 +48,21 @@ struct gb_cpu_state {
     uint16_t pc;   // Program counter
 };
 
+struct gb_ppu_state {
+    uint8_t lcdc;      // LCD Control
+    uint8_t stat;      // LCD Status
+    uint8_t scy, scx;  // Scroll Y/X
+    uint8_t ly;        // LCD Y-Coordinate
+    uint8_t lyc;       // LY Compare
+    uint8_t bgp;       // BG Palette Data
+    uint8_t obp0;      // Object Palette 0 Data
+    uint8_t obp1;      // Object Palette 1 Data
+    uint8_t wy, wx;    // Window Y/X Position
+    uint8_t vram[8192];// Video RAM
+    uint8_t oam[160];  // Object Attribute Memory
+    uint32_t framebuffer[160 * 144]; // RGB framebuffer
+};
+
 // Hardware state including memory and CPU
 struct gb_hw_state {
     uint8_t *rom_data;      // ROM data (up to 32KB for bank 0)
@@ -60,6 +75,8 @@ struct gb_hw_state {
     uint8_t hram[127];      // High RAM
     uint8_t ie;             // Interrupt Enable register
     struct gb_cpu_state cpu;
+    struct gb_ppu_state ppu;
+    uint32_t *framebuffer;
 };
 
 static struct gb_hw_state hw_state;
@@ -186,8 +203,39 @@ static uint8_t __attribute__((noinline)) hw_read_memory(uint16_t addr) {
     return 0xFF; // Unmapped memory returns 0xFF
 }
 
+static void hw_write_ppu_reg(uint16_t addr, uint8_t value) {
+    switch (addr) {
+        case 0xFF40: hw_state.ppu.lcdc = value; break;  // LCDC
+        case 0xFF41: hw_state.ppu.stat = value; break;  // STAT
+        case 0xFF42: hw_state.ppu.scy = value; break;   // SCY
+        case 0xFF43: hw_state.ppu.scx = value; break;   // SCX
+        case 0xFF44: hw_state.ppu.ly = value; break;    // LY
+        case 0xFF45: hw_state.ppu.lyc = value; break;   // LYC
+        case 0xFF47: hw_state.ppu.bgp = value; break;   // BGP
+        case 0xFF48: hw_state.ppu.obp0 = value; break;  // OBP0
+        case 0xFF49: hw_state.ppu.obp1 = value; break;  // OBP1
+        case 0xFF4A: hw_state.ppu.wy = value; break;    // WY
+        case 0xFF4B: hw_state.ppu.wx = value; break;    // WX
+    }
+}
+
 // Memory write callback - will be called by translated code
 static void __attribute__((noinline)) hw_write_memory(uint16_t addr, uint8_t value) {
+    if (addr == 0xFF41) {  // STAT
+        hw_state.ppu.stat = (hw_state.ppu.stat & 0xFC) | (value & 0x03);
+        // Mode bits are read-only
+    } else if (addr == 0xFF44) {  // LY
+        hw_state.ppu.ly = value;
+        // Update STAT mode bits based on LY
+        if (value >= 144) {
+            // V-Blank period (mode 1)
+            hw_state.ppu.stat = (hw_state.ppu.stat & 0xFC) | 0x01;
+        }
+    }
+    if (addr >= 0xFF40 && addr <= 0xFF4B) {
+        hw_write_ppu_reg(addr, value);
+        return;
+    }
     if (addr >= VRAM_START && addr <= VRAM_END) {
         hw_state.vram[addr - VRAM_START] = value;
     }
@@ -282,7 +330,7 @@ static bool create_memory_interface(struct translation_ctx *ctx) {
     return true;
 }
 
-// Simple instruction decoder for initial testing
+// Instruction decoder
 static struct instruction decode_instruction(const uint8_t *code) {
     struct instruction inst = {0};
     inst.opcode = code[0];
@@ -312,11 +360,66 @@ static struct instruction decode_instruction(const uint8_t *code) {
             inst.name = "JP a16";
             inst.length = 3;
             break;
+        case 0xAF:  // XOR A,A (A = 0)
+            inst.name = "XOR A,A";
+            inst.length = 1;
+            break;
+        case 0x21:  // LD HL,d16
+            inst.name = "LD HL,d16";
+            inst.length = 3;
+            break;
+        case 0x32:  // LD (HL-),A
+            inst.name = "LD (HL-),A";
+            inst.length = 1;
+            break;
         default:
             inst.name = "Unknown";
             break;
     }
     return inst;
+}
+
+
+static bool translate_xor_a(struct translation_ctx *ctx) {
+    // Get pointer to A register
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 0, "a_ptr");
+    // Store zero
+    LLVMBuildStore(ctx->builder, LLVMConstInt(ctx->i8_type, 0, false), a_ptr);
+    return true;
+}
+
+static bool translate_ld_hl_d16(struct translation_ctx *ctx, uint16_t value) {
+    // Get pointer to HL
+    LLVMValueRef hl_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 3, "hl_ptr");
+    // Store 16-bit immediate
+    LLVMBuildStore(ctx->builder, LLVMConstInt(ctx->i16_type, value, false), hl_ptr);
+    return true;
+}
+
+static bool translate_ld_hl_dec_a(struct translation_ctx *ctx) {
+    // Load current HL
+    LLVMValueRef hl_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 3, "hl_ptr");
+    LLVMValueRef hl = LLVMBuildLoad2(ctx->builder, ctx->i16_type, hl_ptr, "hl");
+    
+    // Load A value
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+
+    // Store A to memory at (HL)
+    LLVMValueRef args[] = { hl, a };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type, 
+                   ctx->write_memory_fn, args, 2, "");
+
+    // Decrement HL
+    LLVMValueRef new_hl = LLVMBuildSub(ctx->builder, hl,
+        LLVMConstInt(ctx->i16_type, 1, false), "hl_dec");
+    LLVMBuildStore(ctx->builder, new_hl, hl_ptr);
+    
+    return true;
 }
 
 static bool translate_jp_a16(struct translation_ctx *ctx, uint16_t addr) {
@@ -496,7 +599,7 @@ static bool create_translated_function(struct translation_ctx *ctx) {
     return true;
 }
 
-static bool test_translation_and_run(struct translation_ctx *ctx) {
+static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
     // Create main function for translated code
     if (!create_translated_function(ctx)) {
         fprintf(stderr, "Failed to create translation function\n");
@@ -505,7 +608,6 @@ static bool test_translation_and_run(struct translation_ctx *ctx) {
     
     // Translate first few instructions starting at ROM_HEADER_START
     uint16_t pc = ROM_HEADER_START;
-    bool success = true;
     
     printf("Starting translation at 0x%04X\n", pc);
     
@@ -522,7 +624,6 @@ static bool test_translation_and_run(struct translation_ctx *ctx) {
         
         if (!translate_instruction(ctx, &inst, &hw_state.rom_data[pc])) {
             fprintf(stderr, "Failed to translate instruction at 0x%04X\n", pc);
-            success = false;
             break;
         }
         
@@ -580,31 +681,11 @@ static bool test_translation_and_run(struct translation_ctx *ctx) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "Failed to look up function: %s\n", msg);
         LLVMDisposeErrorMessage(msg);
-        return false;
+        return NULL;
     }
     
-    // Cast address to function pointer
-    gb_main_fn translated_code = (gb_main_fn)(intptr_t)addr;
-    
-    // Initialize CPU state for testing
-    struct gb_cpu_state cpu_state = {0};
-    cpu_state.pc = ROM_HEADER_START;
-    
-    printf("\nExecuting translated code...\n");
-    
-    // Execute the translated code
-    translated_code(&cpu_state);
-    
-    // Print resulting CPU state
-    printf("\nCPU state after execution:\n");
-    printf("A: %02X  F: %02X  BC: %02X%02X  DE: %02X%02X  HL: %02X%02X\n",
-           cpu_state.a, cpu_state.f, cpu_state.b, cpu_state.c,
-           cpu_state.d, cpu_state.e, cpu_state.h, cpu_state.l);
-    printf("PC: %04X  SP: %04X\n", cpu_state.pc, cpu_state.sp);
-    
-    // Module is now owned by the JIT
-    ctx->module = NULL;
-    return success;
+    // Cast address to function pointer and return it
+    return (gb_main_fn)(intptr_t)addr;
 }
 
 int main(int argc, char *argv[]) {
@@ -629,11 +710,43 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Testing instruction translation and execution:\n");
-    if (!test_translation_and_run(&ctx)) {
+    gb_main_fn translated_code = test_translation_and_run(&ctx);
+    if (!translated_code) {
         fprintf(stderr, "Translation/execution test failed\n");
         cleanup_translation(&ctx);
         hw_cleanup();
         return 1;
+    }
+
+    // Allocate framebuffer
+    hw_state.framebuffer = calloc(160 * 144, sizeof(uint32_t));
+    if (!hw_state.framebuffer) {
+        fprintf(stderr, "Failed to allocate framebuffer\n");
+        return 1;
+    }
+
+    // Run until first frame
+    bool in_vblank = false;
+    do {
+        // Execute translated code
+        translated_code(&hw_state.cpu);
+        in_vblank = (hw_state.ppu.ly >= 144) && ((hw_state.ppu.stat & 0x03) == 0x01);
+    } while (!in_vblank);
+
+    // Save first frame as PPM
+    FILE *f = fopen("frame.ppm", "wb");
+    if (f) {
+        fprintf(f, "P6\n160 144\n255\n");
+        for (int i = 0; i < 160 * 144; i++) {
+            uint32_t rgb = hw_state.framebuffer[i];
+            uint8_t r = (rgb >> 16) & 0xFF;
+            uint8_t g = (rgb >> 8) & 0xFF;
+            uint8_t b = rgb & 0xFF;
+            fwrite(&r, 1, 1, f);
+            fwrite(&g, 1, 1, f);
+            fwrite(&b, 1, 1, f);
+        }
+        fclose(f);
     }
 
     cleanup_translation(&ctx);

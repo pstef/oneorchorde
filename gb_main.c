@@ -462,6 +462,18 @@ static struct instruction decode_instruction(const uint8_t *code) {
         case 0xC9: // RET
             inst.name = "RET";
             break;
+        case 0xC4: // CALL NZ,a16
+            inst.name = "CALL NZ,a16";
+            inst.length = 3;
+            break;
+        case 0xCC: // CALL Z,a16
+            inst.name = "CALL Z,a16";
+            inst.length = 3;
+            break;
+        case 0xCD: // CALL a16
+            inst.name = "CALL a16";
+            inst.length = 3;
+            break;
         default:
             inst.name = "Unknown";
             break;
@@ -846,6 +858,89 @@ static bool translate_ret(struct translation_ctx *ctx, bool conditional, bool co
     return true;
 }
 
+static bool translate_call(struct translation_ctx *ctx, const uint8_t *code, bool conditional, bool condition) {
+    uint16_t target_addr = code[1] | (code[2] << 8);
+    
+    // For conditional CALL, we need to check the Z flag
+    LLVMBasicBlockRef call_block = NULL;
+    LLVMBasicBlockRef continue_block = NULL;
+    
+    if (conditional) {
+        // Create blocks for the conditional
+        call_block = LLVMAppendBasicBlock(ctx->current_function, "call");
+        continue_block = LLVMAppendBasicBlock(ctx->current_function, "call_continue");
+        
+        // Get Z flag
+        LLVMValueRef z_flag = get_flag_z(ctx);
+        
+        // Compare with zero (for NZ) or non-zero (for Z)
+        LLVMValueRef cond;
+        if (condition) { // CALL Z
+            cond = LLVMBuildICmp(ctx->builder, LLVMIntNE,
+                z_flag, LLVMConstInt(ctx->i8_type, 0, false), "z_check");
+        } else { // CALL NZ
+            cond = LLVMBuildICmp(ctx->builder, LLVMIntEQ,
+                z_flag, LLVMConstInt(ctx->i8_type, 0, false), "nz_check");
+        }
+        
+        LLVMBuildCondBr(ctx->builder, cond, call_block, continue_block);
+        
+        // Position at call block
+        LLVMPositionBuilderAtEnd(ctx->builder, call_block);
+    }
+    
+    // Get SP
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMValueRef sp = LLVMBuildLoad2(ctx->builder, ctx->i16_type, sp_ptr, "sp");
+    
+    // Calculate return address (current PC + instruction length)
+    uint16_t return_addr = (uint16_t)(target_addr + 3);  // 3 is the length of CALL instruction
+    
+    // Push return address (high byte first)
+    LLVMValueRef new_sp = LLVMBuildSub(ctx->builder, sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_dec");
+    
+    // Push high byte
+    LLVMValueRef args1[] = { 
+        new_sp,
+        LLVMConstInt(ctx->i8_type, (return_addr >> 8) & 0xFF, false)
+    };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                   ctx->write_memory_fn, args1, 2, "");
+    
+    // Push low byte
+    new_sp = LLVMBuildSub(ctx->builder, new_sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_dec2");
+    
+    LLVMValueRef args2[] = {
+        new_sp,
+        LLVMConstInt(ctx->i8_type, return_addr & 0xFF, false)
+    };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type,
+                   ctx->write_memory_fn, args2, 2, "");
+    
+    // Update SP
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    // Create target block and branch to it
+    char block_name[32];
+    snprintf(block_name, sizeof(block_name), "addr_%04X", target_addr);
+    LLVMBasicBlockRef target_block = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    LLVMBuildBr(ctx->builder, target_block);
+    
+    if (conditional) {
+        // Position at continue block and create branch
+        LLVMPositionBuilderAtEnd(ctx->builder, continue_block);
+        LLVMBuildBr(ctx->builder, target_block);
+    }
+    
+    // Position at new block
+    LLVMPositionBuilderAtEnd(ctx->builder, target_block);
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -913,6 +1008,12 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_ret(ctx, true, true);
         case 0xC9:  // RET
             return translate_ret(ctx, false, false);
+        case 0xC4:  // CALL NZ,a16
+            return translate_call(ctx, code, true, false);
+        case 0xCC:  // CALL Z,a16
+            return translate_call(ctx, code, true, true);
+        case 0xCD:  // CALL a16
+            return translate_call(ctx, code, false, false);
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

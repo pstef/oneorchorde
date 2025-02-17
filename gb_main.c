@@ -226,15 +226,16 @@ struct translation_ctx {
     LLVMValueRef current_function;
     LLVMOrcLLJITBuilderRef jit_builder;
     LLVMOrcLLJITRef jit;
+    LLVMOrcThreadSafeContextRef tsctx;  // Add this
 
     // Common LLVM types we'll need
-    LLVMTypeRef i8_type;     // 8-bit integer
-    LLVMTypeRef i16_type;    // 16-bit integer
-    LLVMTypeRef void_type;   // void type
+    LLVMTypeRef i8_type;
+    LLVMTypeRef i16_type;
+    LLVMTypeRef void_type;
     
     // Memory access function types
-    LLVMTypeRef read_memory_type;   // uint8_t(uint16_t)
-    LLVMTypeRef write_memory_type;  // void(uint16_t, uint8_t)
+    LLVMTypeRef read_memory_type;
+    LLVMTypeRef write_memory_type;
     
     // Memory access function declarations
     LLVMValueRef read_memory_fn;
@@ -427,6 +428,146 @@ static void cleanup_translation(struct translation_ctx *ctx) {
     if (ctx->jit) {
         LLVMOrcDisposeLLJIT(ctx->jit);
     }
+    if (ctx->tsctx) {
+        LLVMOrcDisposeThreadSafeContext(ctx->tsctx);
+    }
+}
+// Function type for our translated code
+typedef void (*gb_main_fn)(struct gb_cpu_state*);
+
+// Create main function that we'll translate ROM code into
+static bool create_translated_function(struct translation_ctx *ctx) {
+    // Create function type: void gb_main(struct gb_cpu_state*)
+    LLVMTypeRef param_types[] = { 
+        LLVMPointerType(ctx->cpu_state_type, 0) 
+    };
+    LLVMTypeRef function_type = LLVMFunctionType(ctx->void_type, 
+                                                param_types, 1, false);
+    
+    // Add function to module
+    ctx->current_function = LLVMAddFunction(ctx->module, "gb_main", function_type);
+    if (!ctx->current_function) {
+        return false;
+    }
+    
+    // Create entry block
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlock(ctx->current_function, "entry");
+    LLVMPositionBuilderAtEnd(ctx->builder, entry);
+    
+    // Store CPU state pointer
+    ctx->cpu_state_ptr = LLVMGetParam(ctx->current_function, 0);
+    
+    return true;
+}
+
+static bool test_translation_and_run(struct translation_ctx *ctx) {
+    // Create main function for translated code
+    if (!create_translated_function(ctx)) {
+        fprintf(stderr, "Failed to create translation function\n");
+        return false;
+    }
+    
+    // Translate first few instructions starting at ROM_HEADER_START
+    uint16_t pc = ROM_HEADER_START;
+    bool success = true;
+    
+    printf("Starting translation at 0x%04X\n", pc);
+    
+    // Translate up to 10 instructions or until we hit an unknown one
+    for (int i = 0; i < 10 && pc < hw_state.rom_size; i++) {
+        struct instruction inst = decode_instruction(&hw_state.rom_data[pc]);
+        
+        if (strcmp(inst.name, "Unknown") == 0) {
+            printf("Stopping at unknown instruction at 0x%04X\n", pc);
+            break;
+        }
+        
+        printf("Translating 0x%04X: %s\n", pc, inst.name);
+        
+        if (!translate_instruction(ctx, &inst, &hw_state.rom_data[pc])) {
+            fprintf(stderr, "Failed to translate instruction at 0x%04X\n", pc);
+            success = false;
+            break;
+        }
+        
+        pc += inst.length;
+    }
+    
+    // Add return instruction
+    LLVMBuildRetVoid(ctx->builder);
+    
+    // Verify the generated code
+    char *error = NULL;
+    if (LLVMVerifyModule(ctx->module, LLVMPrintMessageAction, &error) != 0) {
+        fprintf(stderr, "Module verification failed\n");
+        LLVMDisposeMessage(error);
+        return false;
+    }
+    
+    // Print generated IR for inspection
+    char *ir = LLVMPrintModuleToString(ctx->module);
+    printf("\nGenerated LLVM IR:\n%s\n", ir);
+    LLVMDisposeMessage(ir);
+    
+    // Create thread-safe module for JIT
+    LLVMOrcThreadSafeContextRef tsctx = LLVMOrcCreateNewThreadSafeContext();
+    if (!tsctx) {
+        fprintf(stderr, "Failed to create thread-safe context\n");
+        return false;
+    }
+    
+    LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(
+        ctx->module, tsctx);
+    if (!tsm) {
+        fprintf(stderr, "Failed to create thread-safe module\n");
+        LLVMOrcDisposeThreadSafeContext(tsctx);
+        return false;
+    }
+    
+    // Add module to JIT
+    LLVMOrcJITDylibRef main_jd = LLVMOrcLLJITGetMainJITDylib(ctx->jit);
+    LLVMErrorRef err = LLVMOrcLLJITAddLLVMIRModule(ctx->jit, main_jd, tsm);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "Failed to add module to JIT: %s\n", msg);
+        LLVMDisposeErrorMessage(msg);
+        LLVMOrcDisposeThreadSafeModule(tsm);
+        LLVMOrcDisposeThreadSafeContext(tsctx);
+        return false;
+    }
+    
+    // Look up the generated function
+    LLVMOrcJITTargetAddress addr = 0;
+    err = LLVMOrcLLJITLookup(ctx->jit, &addr, "gb_main");
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "Failed to look up function: %s\n", msg);
+        LLVMDisposeErrorMessage(msg);
+        return false;
+    }
+    
+    // Cast address to function pointer
+    gb_main_fn translated_code = (gb_main_fn)(intptr_t)addr;
+    
+    // Initialize CPU state for testing
+    struct gb_cpu_state cpu_state = {0};
+    cpu_state.pc = ROM_HEADER_START;
+    
+    printf("\nExecuting translated code...\n");
+    
+    // Execute the translated code
+    translated_code(&cpu_state);
+    
+    // Print resulting CPU state
+    printf("\nCPU state after execution:\n");
+    printf("A: %02X  F: %02X  BC: %02X%02X  DE: %02X%02X  HL: %02X%02X\n",
+           cpu_state.a, cpu_state.f, cpu_state.b, cpu_state.c,
+           cpu_state.d, cpu_state.e, cpu_state.h, cpu_state.l);
+    printf("PC: %04X  SP: %04X\n", cpu_state.pc, cpu_state.sp);
+    
+    // Module is now owned by the JIT
+    ctx->module = NULL;
+    return success;
 }
 
 int main(int argc, char *argv[]) {
@@ -450,7 +591,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("LLVM initialized successfully\n");
+    printf("Testing instruction translation and execution:\n");
+    if (!test_translation_and_run(&ctx)) {
+        fprintf(stderr, "Translation/execution test failed\n");
+        cleanup_translation(&ctx);
+        hw_cleanup();
+        return 1;
+    }
 
     cleanup_translation(&ctx);
     hw_cleanup();

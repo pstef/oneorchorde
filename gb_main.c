@@ -1,3 +1,323 @@
+/*
+OneOrchorde - GameBoy to Native Code Translator
+
+Project Overview:
+---------------
+This project translates GameBoy ROM dumps to native machine code using LLVM ORC JIT.
+Translation happens once at ROM load time. The translated code interacts with
+emulated hardware components implemented in C.
+
+Architecture:
+-----------
+1. Translation Pipeline:
+   ROM -> Instruction Decoder -> LLVM IR Generator -> Native Code
+
+2. Hardware Emulation:
+   - Memory Map (0x0000-0xFFFF)
+   - Basic PPU (enough for simple games)
+   - No APU (sound) emulation yet
+   - No MBC (Memory Bank Controller) support yet
+
+3. LLVM Integration:
+   - Using ORC JIT (not legacy JIT)
+   - Static linking with LLVM libraries
+   - Single-module design for now
+   - No optimization passes yet
+
+Current Implementation Status:
+---------------------------
+1. CPU Translation
+   See comment below
+
+2. Memory Implementation:
+   - ROM bank 0 (0x0000-0x3FFF): Read-only
+   - VRAM (0x8000-0x9FFF): Read-write
+   - WRAM (0xC000-0xDFFF): Read-write
+   - OAM (0xFE00-0xFE9F): Read-write
+   - I/O registers (0xFF00-0xFF7F): Partial implementation
+   - HRAM (0xFF80-0xFFFE): Read-write
+   - IE register (0xFFFF): Read-write
+
+3. PPU Implementation:
+   - Basic register support (LCDC, STAT, etc.)
+   - No actual rendering yet
+   - Minimal timing simulation
+
+Translation Process Details:
+-------------------------
+1. Instruction Translation:
+   ROM instruction -> LLVM IR builder calls -> Native code
+   Example for "LD A,n":
+   - Load immediate from code[]
+   - Get A register pointer from cpu_state
+   - Generate store instruction
+
+2. Hardware Access:
+   Generated code -> hw_read_memory()/hw_write_memory() -> Hardware emulation
+   All hardware access goes through these two functions
+
+3. Control Flow:
+   - Basic blocks created for each potential jump target
+   - Conditional execution using LLVM branch instructions
+   - Return addresses handled on emulated stack
+
+Current Limitations:
+-----------------
+1. ROM Support:
+   - No MBC support (32KB ROMs only)
+   - No save RAM support
+   - No ROM bank switching
+
+2. CPU Limitations:
+   - No timing accuracy
+   - Limited instruction set
+   - No interrupt support yet
+
+3. Graphics:
+   - No sprite support
+   - No window support
+   - No actual pixel processing
+
+Development Milestones:
+--------------------
+✓ Milestone 1: Basic ROM loading and validation
+✓ Milestone 2: Initial instruction translation
+✓ Milestone 3: Basic memory read/write support
+Current -> Milestone 4: Implement enough instructions for Alleyway
+Future  -> Milestone 5: Add interrupt support
+Future  -> Milestone 6: Implement basic PPU
+
+Build Requirements:
+----------------
+- LLVM 16+ (statically linked)
+- C23 compiler
+- No external dependencies beyond LLVM
+
+Testing Strategy:
+---------------
+1. ROM header validation
+2. Individual instruction translation
+3. Basic block formation
+4. Memory access patterns
+5. Hardware state consistency
+
+File Organization:
+----------------
+gb_main.c:     Main implementation file
+test_rom.c:    Test ROM generation
+[Additional files only when needed for sharing definitions]
+*/
+
+/*
+CPU Translation
+--------------------------------
+
+Register Layout in CPU State (struct gb_cpu_state indices):
+- 0: A (Accumulator)
+- 1: F (Flags: Z N H C 0 0 0 0)
+- 2: B
+- 3: C
+- 4: D
+- 5: E
+- 6: H
+- 7: L
+- 8: SP (Stack Pointer)
+- 9: PC (Program Counter)
+
+Currently Implemented Instructions:
+--------------------------------
+
+Load 8-bit:
+- 0x3E: LD A,d8      (Load immediate into A)
+- 0x06: LD B,d8      (Load immediate into B)
+- 0xFA: LD A,(a16)   (Load from memory into A)
+- 0xEA: LD (a16),A   (Store A to memory)
+- 0xF0: LDH A,(a8)   (Load from high memory into A)
+- 0xE0: LDH (a8),A   (Store A to high memory)
+- 0x77: LD (HL),A    (Store A to memory at HL)
+- 0x7E: LD A,(HL)    (Load from memory at HL into A)
+
+Load 16-bit:
+- 0x21: LD HL,d16    (Load immediate into HL)
+
+Load with increment/decrement:
+- 0x2A: LD A,(HL+)   (Load from HL and increment)
+- 0x22: LD (HL+),A   (Store to HL and increment)
+- 0x32: LD (HL-),A   (Store to HL and decrement)
+
+Stack Operations:
+- 0xC5: PUSH BC      (Push BC onto stack)
+- 0xD5: PUSH DE      (Push DE onto stack)
+- 0xE5: PUSH HL      (Push HL onto stack)
+- 0xF5: PUSH AF      (Push AF onto stack)
+- 0xC1: POP BC       (Pop into BC from stack)
+- 0xD1: POP DE       (Pop into DE from stack)
+- 0xE1: POP HL       (Pop into HL from stack)
+- 0xF1: POP AF       (Pop into AF from stack)
+
+Arithmetic/Logic:
+- 0xAF: XOR A,A      (Clear A register)
+- 0x80: ADD A,B      (Add B to A)
+- 0x81: ADD A,C      (Add C to A)
+- 0x82: ADD A,D      (Add D to A)
+- 0x83: ADD A,E      (Add E to A)
+- 0x84: ADD A,H      (Add H to A)
+- 0x85: ADD A,L      (Add L to A)
+- 0x87: ADD A,A      (Add A to A)
+- 0xC6: ADD A,d8     (Add immediate to A)
+- 0x04: INC B        (Increment B)
+- 0x0C: INC C        (Increment C)
+
+Control Flow:
+- 0x00: NOP          (No operation)
+- 0xC3: JP a16       (Jump to immediate address)
+- 0xC0: RET NZ       (Return if not zero)
+- 0xC8: RET Z        (Return if zero)
+- 0xC9: RET          (Return unconditionally)
+- 0xC4: CALL NZ,a16  (Call if not zero)
+- 0xCC: CALL Z,a16   (Call if zero)
+- 0xCD: CALL a16     (Call unconditionally)
+- RST vectors:
+  - 0xC7: RST 00H    (Call 0x0000)
+  - 0xCF: RST 08H    (Call 0x0008)
+  - 0xD7: RST 10H    (Call 0x0010)
+  - 0xDF: RST 18H    (Call 0x0018)
+  - 0xE7: RST 20H    (Call 0x0020)
+  - 0xEF: RST 28H    (Call 0x0028)
+  - 0xF7: RST 30H    (Call 0x0030)
+  - 0xFF: RST 38H    (Call 0x0038)
+
+TODO for Alleyway:
+-----------------
+1. Memory-Related Instructions:
+   - CP (HL)      (Compare A with memory)
+   - AND (HL)     (AND memory with A)
+   - OR (HL)      (OR memory with A)
+
+2. Arithmetic/Logic Instructions:
+   - SUB r        (Subtract register from A)
+   - SUB (HL)     (Subtract memory from A)
+   - AND r        (AND register with A)
+   - OR r         (OR register with A)
+
+3. Control Flow Instructions:
+   - JR NZ,r8     (Relative jump if not zero)
+   - JR Z,r8      (Relative jump if zero)
+
+4. Bit Operations:
+   - BIT b,r      (Test bit b in register)
+   - BIT b,(HL)   (Test bit b in memory)
+
+Known Limitations:
+----------------
+1. Timing is not implemented - no cycle counting
+2. No interrupt handling yet
+3. No PPU timing emulation
+4. Limited memory bank switching support
+
+Next Steps:
+----------
+1. Implement CP instruction for collision detection
+2. Add basic timing support for PPU synchronization
+3. Implement remaining arithmetic instructions
+4. Add support for input handling
+
+Flag Handling (F Register):
+-------------------------
+Layout (bits 7-4 only, bits 3-0 always zero):
+- Bit 7: Z (Zero Flag)
+  Set when: Result of operation is zero
+  Clear when: Result of operation is non-zero
+  Used by: Conditional jumps, calls, returns (Z/NZ conditions)
+
+- Bit 6: N (Subtract Flag)
+  Set when: Last operation was a subtraction
+  Clear when: Last operation was an addition or logical operation
+  Used by: DAA instruction (BCD adjustment, not implemented yet)
+
+- Bit 5: H (Half Carry Flag)
+  Set when: Carry from bit 3 to bit 4 in last operation
+  Clear when: No carry from bit 3
+  For addition: Set if (val1 & 0xF) + (val2 & 0xF) > 0xF
+  For subtraction: Set if borrow from bit 4
+  Used by: DAA instruction
+
+- Bit 4: C (Carry Flag)
+  Set when: Result overflowed 8 bits / borrow was needed
+  Clear when: No overflow / no borrow needed
+  For addition: Set if result > 0xFF
+  For subtraction: Set if borrow needed (val1 < val2)
+  Used by: ADC, SBC, conditional jumps (C/NC conditions)
+
+Currently Implemented Flag Operations:
+----------------------------------
+1. ADD A,r/n updates all flags:
+   - Z: Set if result is zero
+   - N: Reset (0)
+   - H: Set if carry from bit 3
+   - C: Set if result exceeded 0xFF
+
+2. INC r updates Z, N, H:
+   - Z: Set if result is zero
+   - N: Reset (0)
+   - H: Set if carry from bit 3
+   - C: Preserved (unchanged)
+
+3. XOR A updates all flags:
+   - Z: Set (A becomes 0)
+   - N: Reset (0)
+   - H: Reset (0)
+   - C: Reset (0)
+
+Flag Helper Functions:
+-------------------
+get_flag_z():
+- Returns current Z flag value
+- Used by conditional instructions (RET Z/NZ, CALL Z/NZ)
+
+set_flag_z():
+- Sets Z flag while preserving others
+- Used by arithmetic and logical operations
+
+update_flags_add():
+- Updates all flags after addition
+- Handles H and C flag computation for 8-bit addition
+
+TODO for Flag Handling:
+---------------------
+1. Add update_flags_sub() for subtraction operations:
+   - Proper H flag handling for borrow from bit 4
+   - C flag set when borrow needed
+   - N flag set to indicate subtraction
+
+2. Add update_flags_logical() for AND/OR operations:
+   - Z flag based on result
+   - N and C always reset
+   - H flag set for AND, reset for OR
+
+3. Add flag handling for:
+   - CP (compare) instruction
+   - Bit test instructions
+   - 16-bit arithmetic
+
+4. Add helper functions for:
+   - Individual flag manipulation
+   - Flag condition testing (for JP cc,nn etc.)
+
+Important Notes:
+--------------
+1. Half-carry (H) flag computation:
+   - For addition: ((a & 0xF) + (b & 0xF)) & 0x10
+   - For subtraction: ((a & 0xF) - (b & 0xF)) & 0x10
+
+2. When implementing CP:
+   - Updates flags like SUB but doesn't store result
+   - Z set if A == operand
+   - N always set (indicates comparison)
+   - H set if borrow from bit 4
+   - C set if A < operand
+*/
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>

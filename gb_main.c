@@ -156,17 +156,12 @@ Stack Operations:
 - 0xF1: POP AF       (Pop into AF from stack)
 
 Arithmetic/Logic:
-- 0xAF: XOR A,A      (Clear A register)
-- 0x80: ADD A,B      (Add B to A)
-- 0x81: ADD A,C      (Add C to A)
-- 0x82: ADD A,D      (Add D to A)
-- 0x83: ADD A,E      (Add E to A)
-- 0x84: ADD A,H      (Add H to A)
-- 0x85: ADD A,L      (Add L to A)
-- 0x87: ADD A,A      (Add A to A)
-- 0xC6: ADD A,d8     (Add immediate to A)
-- 0x04: INC B        (Increment B)
-- 0x0C: INC C        (Increment C)
+- 0x80-0x87: ADD A,r    (Add register to A)
+- 0xC6: ADD A,d8        (Add immediate to A)
+- 0xCE: ADC A,d8        (Add immediate and carry to A)
+- 0xAF: XOR A,A         (Clear A register)
+- 0x04: INC B           (Increment B)
+- 0x0C: INC C           (Increment C)
 
 Compare Instructions:
 - 0xBE: CP (HL)      (Compare A with memory at HL)
@@ -262,24 +257,38 @@ Currently Implemented Flag Operations:
    - N: Reset (0)
    - H: Set if carry from bit 3
    - C: Set if result exceeded 0xFF
+   Note: ADD ignores current carry flag
 
-2. INC r updates Z, N, H:
+2. ADC A,d8 updates all flags:
+   - Z: Set if result is zero
+   - N: Reset (0)
+   - H: Set if carry from bit 3 (includes current carry)
+   - C: Set if result exceeded 0xFF (includes current carry)
+   Note: ADC adds current carry flag to result
+
+3. INC r updates Z, N, H:
    - Z: Set if result is zero
    - N: Reset (0)
    - H: Set if carry from bit 3
    - C: Preserved (unchanged)
 
-3. XOR A updates all flags:
+4. XOR A updates all flags:
    - Z: Set (A becomes 0)
    - N: Reset (0)
    - H: Reset (0)
    - C: Reset (0)
 
-4. CP updates all flags:
+5. CP updates all flags:
    - Z: Set if A equals operand
    - N: Set (1)
    - H: Set if borrow from bit 4
    - C: Set if A < operand
+
+6. ADC A,d8 updates all flags:
+   - Z: Set if result is zero
+   - N: Reset (0)
+   - H: Set if carry from bit 3 (includes current carry)
+   - C: Set if result exceeded 0xFF (includes current carry)
 
 Flag Helper Functions:
 -------------------
@@ -903,6 +912,10 @@ static struct instruction decode_instruction(const uint8_t *code) {
         case 0xBF:  // CP A
             inst.name = "CP A";
             break;
+        case 0xCE:  // ADC A,d8
+            inst.name = "ADC A,d8";
+            inst.length = 2;
+            break;
         default:
             inst.name = "Unknown";
             break;
@@ -1420,12 +1433,24 @@ static bool translate_rst(struct translation_ctx *ctx, uint8_t vector) {
     return true;
 }
 
+static LLVMValueRef get_flag_c(struct translation_ctx *ctx) {
+    // Get F register
+    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 1, "f_ptr");
+    LLVMValueRef f = LLVMBuildLoad2(ctx->builder, ctx->i8_type, f_ptr, "f");
+    
+    // Extract C flag (bit 4) and shift it to bit 0
+    LLVMValueRef c = LLVMBuildLShr(ctx->builder, f,
+        LLVMConstInt(ctx->i8_type, 4, false), "c_shifted");
+    return LLVMBuildAnd(ctx->builder, c,
+        LLVMConstInt(ctx->i8_type, 0x01, false), "c_flag");
+}
 
 static void update_flags_add(struct translation_ctx *ctx, LLVMValueRef result, 
-                           LLVMValueRef a, LLVMValueRef b) {
+                           LLVMValueRef a, LLVMValueRef b, LLVMValueRef carry) {
     // Get F register pointer
     LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
-                                            ctx->cpu_state_ptr, 1, "f_ptr");
+                                           ctx->cpu_state_ptr, 1, "f_ptr");
     
     // Zero flag (bit 7) - Set if result is zero
     LLVMValueRef zero = LLVMBuildICmp(ctx->builder, LLVMIntEQ,
@@ -1438,19 +1463,28 @@ static void update_flags_add(struct translation_ctx *ctx, LLVMValueRef result,
     LLVMValueRef n_flag = LLVMConstInt(ctx->i8_type, 0, false);
     
     // Half carry flag (bit 5) - Set if carry from bit 3
-    LLVMValueRef h = LLVMBuildAnd(ctx->builder,
-        LLVMBuildXor(ctx->builder,
-            LLVMBuildXor(ctx->builder, a, b, "h_xor1"),
-            result, "h_xor2"),
-        LLVMConstInt(ctx->i8_type, 0x10, false), "h_and");
-    LLVMValueRef h_flag = LLVMBuildLShr(ctx->builder, h,
-        LLVMConstInt(ctx->i8_type, 1, false), "h_flag_shifted");
+    // For ADC, need to include the carry in the calculation
+    LLVMValueRef h_sum = LLVMBuildAdd(ctx->builder,
+        LLVMBuildAdd(ctx->builder,
+            LLVMBuildAnd(ctx->builder, a, LLVMConstInt(ctx->i8_type, 0x0F, false), "a_low"),
+            LLVMBuildAnd(ctx->builder, b, LLVMConstInt(ctx->i8_type, 0x0F, false), "b_low"),
+            "low_sum"),
+        carry, "low_sum_c");
+    LLVMValueRef h = LLVMBuildICmp(ctx->builder, LLVMIntUGT,
+        h_sum, LLVMConstInt(ctx->i8_type, 0x0F, false), "h_carry");
+    LLVMValueRef h_flag = LLVMBuildZExt(ctx->builder, h, ctx->i8_type, "h_flag");
+    h_flag = LLVMBuildShl(ctx->builder, h_flag,
+        LLVMConstInt(ctx->i8_type, 5, false), "h_flag_shifted");
     
     // Carry flag (bit 4) - Set if result overflowed
+    // For ADC, need 16 bits to handle the carry
     LLVMValueRef sum = LLVMBuildAdd(ctx->builder,
-        LLVMBuildZExt(ctx->builder, a, ctx->i16_type, "a_ext"),
-        LLVMBuildZExt(ctx->builder, b, ctx->i16_type, "b_ext"),
-        "sum");
+        LLVMBuildAdd(ctx->builder,
+            LLVMBuildZExt(ctx->builder, a, ctx->i16_type, "a_ext"),
+            LLVMBuildZExt(ctx->builder, b, ctx->i16_type, "b_ext"),
+            "sum"),
+        LLVMBuildZExt(ctx->builder, carry, ctx->i16_type, "carry_ext"),
+        "sum_c");
     LLVMValueRef c = LLVMBuildICmp(ctx->builder, LLVMIntUGT,
         sum, LLVMConstInt(ctx->i16_type, 0xFF, false), "carry");
     LLVMValueRef c_flag = LLVMBuildZExt(ctx->builder, c, ctx->i8_type, "c_flag");
@@ -1471,19 +1505,19 @@ static void update_flags_add(struct translation_ctx *ctx, LLVMValueRef result,
 static bool translate_add_a_r(struct translation_ctx *ctx, int reg_idx) {
     // Get A register
     LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
-                                            ctx->cpu_state_ptr, 0, "a_ptr");
+                                           ctx->cpu_state_ptr, 0, "a_ptr");
     LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
     
     // Get source register
     LLVMValueRef src_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
-                                              ctx->cpu_state_ptr, reg_idx, "src_ptr");
+                                             ctx->cpu_state_ptr, reg_idx, "src_ptr");
     LLVMValueRef src = LLVMBuildLoad2(ctx->builder, ctx->i8_type, src_ptr, "src");
     
     // Perform addition
     LLVMValueRef result = LLVMBuildAdd(ctx->builder, a, src, "add_result");
     
-    // Update flags
-    update_flags_add(ctx, result, a, src);
+    // Update flags with carry=0
+    update_flags_add(ctx, result, a, src, LLVMConstInt(ctx->i8_type, 0, false));
     
     // Store result in A
     LLVMBuildStore(ctx->builder, result, a_ptr);
@@ -1494,7 +1528,7 @@ static bool translate_add_a_r(struct translation_ctx *ctx, int reg_idx) {
 static bool translate_add_a_n(struct translation_ctx *ctx, uint8_t n) {
     // Get A register
     LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
-                                            ctx->cpu_state_ptr, 0, "a_ptr");
+                                           ctx->cpu_state_ptr, 0, "a_ptr");
     LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
     
     // Create immediate value
@@ -1503,8 +1537,8 @@ static bool translate_add_a_n(struct translation_ctx *ctx, uint8_t n) {
     // Perform addition
     LLVMValueRef result = LLVMBuildAdd(ctx->builder, a, imm, "add_result");
     
-    // Update flags
-    update_flags_add(ctx, result, a, imm);
+    // Update flags with carry=0
+    update_flags_add(ctx, result, a, imm, LLVMConstInt(ctx->i8_type, 0, false));
     
     // Store result in A
     LLVMBuildStore(ctx->builder, result, a_ptr);
@@ -1682,6 +1716,35 @@ static bool translate_cp_r(struct translation_ctx *ctx, int reg_idx) {
     return true;
 }
 
+static bool translate_adc_n(struct translation_ctx *ctx, uint8_t n) {
+    // Get A register
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+    
+    // Get carry flag
+    LLVMValueRef carry = get_flag_c(ctx);
+    
+    // Create immediate value
+    LLVMValueRef imm = LLVMConstInt(ctx->i8_type, n, false);
+    
+    // Add with carry
+    LLVMValueRef sum = LLVMBuildAdd(ctx->builder,
+        LLVMBuildAdd(ctx->builder, a, imm, "sum"),
+        carry, "sum_c");
+    
+    // Truncate to 8 bits
+    LLVMValueRef result = LLVMBuildTrunc(ctx->builder, sum, ctx->i8_type, "result");
+    
+    // Update flags
+    update_flags_add(ctx, result, a, imm, carry);
+    
+    // Store result in A
+    LLVMBuildStore(ctx->builder, result, a_ptr);
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -1810,6 +1873,8 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_cp_r(ctx, 7);  // L = 7
         case 0xBF:  // CP A
             return translate_cp_r(ctx, 0);  // A = 0
+        case 0xCE:  // ADC A,d8
+            return translate_adc_n(ctx, code[1]);
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

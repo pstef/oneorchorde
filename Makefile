@@ -5,7 +5,7 @@ ifeq ($(LLVM_CONFIG),)
     $(error "No llvm-config found. Please install LLVM development packages (version 15 or newer)")
 endif
 
-CFLAGS = -std=c2x -Wall
+CFLAGS = -std=c2x -Wall -Wno-unused
 ALL_FLAGS = $(shell $(LLVM_CONFIG) --cflags) $(CFLAGS)
 LDFLAGS = $(shell $(LLVM_CONFIG) --ldflags --system-libs --libs core)
 

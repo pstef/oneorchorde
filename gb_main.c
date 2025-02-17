@@ -168,6 +168,17 @@ Arithmetic/Logic:
 - 0x04: INC B        (Increment B)
 - 0x0C: INC C        (Increment C)
 
+Compare Instructions:
+- 0xBE: CP (HL)      (Compare A with memory at HL)
+- 0xFE: CP d8        (Compare A with immediate)
+- 0xB8: CP B         (Compare A with B)
+- 0xB9: CP C         (Compare A with C)
+- 0xBA: CP D         (Compare A with D)
+- 0xBB: CP E         (Compare A with E)
+- 0xBC: CP H         (Compare A with H)
+- 0xBD: CP L         (Compare A with L)
+- 0xBF: CP A         (Compare A with itself)
+
 Control Flow:
 - 0x00: NOP          (No operation)
 - 0xC3: JP a16       (Jump to immediate address)
@@ -189,22 +200,17 @@ Control Flow:
 
 TODO for Alleyway:
 -----------------
-1. Memory-Related Instructions:
-   - CP (HL)      (Compare A with memory)
-   - AND (HL)     (AND memory with A)
-   - OR (HL)      (OR memory with A)
-
-2. Arithmetic/Logic Instructions:
+1. Arithmetic/Logic Instructions:
    - SUB r        (Subtract register from A)
    - SUB (HL)     (Subtract memory from A)
    - AND r        (AND register with A)
    - OR r         (OR register with A)
 
-3. Control Flow Instructions:
+2. Control Flow Instructions:
    - JR NZ,r8     (Relative jump if not zero)
    - JR Z,r8      (Relative jump if zero)
 
-4. Bit Operations:
+3. Bit Operations:
    - BIT b,r      (Test bit b in register)
    - BIT b,(HL)   (Test bit b in memory)
 
@@ -269,6 +275,12 @@ Currently Implemented Flag Operations:
    - H: Reset (0)
    - C: Reset (0)
 
+4. CP updates all flags:
+   - Z: Set if A equals operand
+   - N: Set (1)
+   - H: Set if borrow from bit 4
+   - C: Set if A < operand
+
 Flag Helper Functions:
 -------------------
 get_flag_z():
@@ -283,24 +295,24 @@ update_flags_add():
 - Updates all flags after addition
 - Handles H and C flag computation for 8-bit addition
 
+update_flags_sub():
+- Updates all flags for subtraction operations
+- Sets N flag to indicate subtraction
+- Handles H and C flags for borrow
+- Used by CP and SUB instructions
+
 TODO for Flag Handling:
 ---------------------
-1. Add update_flags_sub() for subtraction operations:
-   - Proper H flag handling for borrow from bit 4
-   - C flag set when borrow needed
-   - N flag set to indicate subtraction
-
-2. Add update_flags_logical() for AND/OR operations:
+1. Add update_flags_logical() for AND/OR operations:
    - Z flag based on result
    - N and C always reset
    - H flag set for AND, reset for OR
 
-3. Add flag handling for:
-   - CP (compare) instruction
+2. Add flag handling for:
    - Bit test instructions
    - 16-bit arithmetic
 
-4. Add helper functions for:
+3. Add helper functions for:
    - Individual flag manipulation
    - Flag condition testing (for JP cc,nn etc.)
 
@@ -316,6 +328,12 @@ Important Notes:
    - N always set (indicates comparison)
    - H set if borrow from bit 4
    - C set if A < operand
+
+3. CP instruction usage in Alleyway:
+   - CP d8: Used for boundary checks (screen edges)
+   - CP (HL): Used for collision detection with sprites
+   - CP r: Used for position comparisons
+   - All CP variants update flags without modifying A
 */
 
 #include <stdint.h>
@@ -854,6 +872,36 @@ static struct instruction decode_instruction(const uint8_t *code) {
             break;
         case 0x0D: // DEC C
             inst.name = "DEC C";
+            break;
+        case 0xBE: // CP (HL)
+            inst.name = "CP (HL)";
+            inst.length = 1;
+            break;
+        // In decode_instruction, add:
+        case 0xFE:  // CP d8
+            inst.name = "CP d8";
+            inst.length = 2;
+            break;
+        case 0xB8:  // CP B
+            inst.name = "CP B";
+            break;
+        case 0xB9:  // CP C
+            inst.name = "CP C";
+            break;
+        case 0xBA:  // CP D
+            inst.name = "CP D";
+            break;
+        case 0xBB:  // CP E
+            inst.name = "CP E";
+            break;
+        case 0xBC:  // CP H
+            inst.name = "CP H";
+            break;
+        case 0xBD:  // CP L
+            inst.name = "CP L";
+            break;
+        case 0xBF:  // CP A
+            inst.name = "CP A";
             break;
         default:
             inst.name = "Unknown";
@@ -1510,6 +1558,130 @@ static bool translate_inc_r(struct translation_ctx *ctx, int reg_idx) {
     return true;
 }
 
+static void update_flags_sub(struct translation_ctx *ctx, LLVMValueRef result, 
+                           LLVMValueRef a, LLVMValueRef b, bool store_result) {
+    // Get F register pointer
+    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 1, "f_ptr");
+    
+    // Zero flag (bit 7) - Set if result is zero
+    LLVMValueRef zero = LLVMBuildICmp(ctx->builder, LLVMIntEQ,
+        result, LLVMConstInt(ctx->i8_type, 0, false), "zero");
+    LLVMValueRef z_flag = LLVMBuildZExt(ctx->builder, zero, ctx->i8_type, "z_flag");
+    z_flag = LLVMBuildShl(ctx->builder, z_flag, 
+        LLVMConstInt(ctx->i8_type, 7, false), "z_flag_shifted");
+    
+    // Subtract flag (bit 6) - Set for subtraction
+    LLVMValueRef n_flag = LLVMConstInt(ctx->i8_type, 0x40, false);
+    
+    // Half carry flag (bit 5) - Set if borrow from bit 4
+    LLVMValueRef h = LLVMBuildAnd(ctx->builder,
+        LLVMBuildXor(ctx->builder,
+            LLVMBuildXor(ctx->builder, a, b, "h_xor1"),
+            result, "h_xor2"),
+        LLVMConstInt(ctx->i8_type, 0x10, false), "h_and");
+    LLVMValueRef h_flag = LLVMBuildLShr(ctx->builder, h,
+        LLVMConstInt(ctx->i8_type, 1, false), "h_flag_shifted");
+    
+    // Carry flag (bit 4) - Set if result required borrow
+    LLVMValueRef c = LLVMBuildICmp(ctx->builder, LLVMIntULT,
+        a, b, "borrow");
+    LLVMValueRef c_flag = LLVMBuildZExt(ctx->builder, c, ctx->i8_type, "c_flag");
+    c_flag = LLVMBuildShl(ctx->builder, c_flag,
+        LLVMConstInt(ctx->i8_type, 4, false), "c_flag_shifted");
+    
+    // Combine flags
+    LLVMValueRef flags = LLVMBuildOr(ctx->builder,
+        LLVMBuildOr(ctx->builder,
+            LLVMBuildOr(ctx->builder, z_flag, n_flag, "flags_1"),
+            h_flag, "flags_2"),
+        c_flag, "flags_final");
+    
+    // Store flags
+    LLVMBuildStore(ctx->builder, flags, f_ptr);
+    
+    // For CP, we don't store the result
+    if (store_result) {
+        // Get A register pointer and store result
+        LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                               ctx->cpu_state_ptr, 0, "a_ptr");
+        LLVMBuildStore(ctx->builder, result, a_ptr);
+    }
+}
+
+static bool translate_cp_hl(struct translation_ctx *ctx) {
+    // Get A register
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+    
+    // Get HL pointer
+    LLVMValueRef h_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 6, "h_ptr");
+    LLVMValueRef l_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 7, "l_ptr");
+    
+    // Load H and L
+    LLVMValueRef h = LLVMBuildLoad2(ctx->builder, ctx->i8_type, h_ptr, "h");
+    LLVMValueRef l = LLVMBuildLoad2(ctx->builder, ctx->i8_type, l_ptr, "l");
+    
+    // Create 16-bit address
+    LLVMValueRef hl = LLVMBuildOr(ctx->builder,
+        LLVMBuildShl(ctx->builder, h, LLVMConstInt(ctx->i8_type, 8, false), "h_shifted"),
+        l, "hl");
+    
+    // Read memory at (HL)
+    LLVMValueRef args[] = { hl };
+    LLVMValueRef value = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                      ctx->read_memory_fn, args, 1, "mem_val");
+    
+    // Perform subtraction
+    LLVMValueRef result = LLVMBuildSub(ctx->builder, a, value, "cp_result");
+    
+    // Update flags but don't store result
+    update_flags_sub(ctx, result, a, value, false);
+    
+    return true;
+}
+
+static bool translate_cp_n(struct translation_ctx *ctx, uint8_t n) {
+    // Get A register
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+    
+    // Create immediate value
+    LLVMValueRef imm = LLVMConstInt(ctx->i8_type, n, false);
+    
+    // Perform subtraction
+    LLVMValueRef result = LLVMBuildSub(ctx->builder, a, imm, "cp_result");
+    
+    // Update flags but don't store result
+    update_flags_sub(ctx, result, a, imm, false);
+    
+    return true;
+}
+
+static bool translate_cp_r(struct translation_ctx *ctx, int reg_idx) {
+    // Get A register
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+    
+    // Get source register
+    LLVMValueRef src_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, reg_idx, "src_ptr");
+    LLVMValueRef src = LLVMBuildLoad2(ctx->builder, ctx->i8_type, src_ptr, "src");
+    
+    // Perform subtraction
+    LLVMValueRef result = LLVMBuildSub(ctx->builder, a, src, "cp_result");
+    
+    // Update flags but don't store result
+    update_flags_sub(ctx, result, a, src, false);
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -1619,6 +1791,25 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_inc_r(ctx, 2);
         case 0x0C: // INC C
             return translate_inc_r(ctx, 3);
+        case 0xBE: // CP (HL)
+            return translate_cp_hl(ctx);
+        // In translate_instruction, add:
+        case 0xFE:  // CP d8
+            return translate_cp_n(ctx, code[1]);
+        case 0xB8:  // CP B
+            return translate_cp_r(ctx, 2);  // B = 2
+        case 0xB9:  // CP C
+            return translate_cp_r(ctx, 3);  // C = 3
+        case 0xBA:  // CP D
+            return translate_cp_r(ctx, 4);  // D = 4
+        case 0xBB:  // CP E
+            return translate_cp_r(ctx, 5);  // E = 5
+        case 0xBC:  // CP H
+            return translate_cp_r(ctx, 6);  // H = 6
+        case 0xBD:  // CP L
+            return translate_cp_r(ctx, 7);  // L = 7
+        case 0xBF:  // CP A
+            return translate_cp_r(ctx, 0);  // A = 0
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

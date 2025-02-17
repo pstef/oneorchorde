@@ -62,18 +62,6 @@ struct gb_hw_state {
     struct gb_cpu_state cpu;
 };
 
-// Translation context
-struct translation_ctx {
-    LLVMContextRef ctx;
-    LLVMModuleRef module;
-    LLVMBuilderRef builder;
-    LLVMTypeRef cpu_state_type;
-    LLVMValueRef cpu_state_ptr;
-    LLVMValueRef current_function;
-    LLVMOrcLLJITBuilderRef jit_builder;
-    LLVMOrcLLJITRef jit;
-};
-
 static struct gb_hw_state hw_state;
 
 static void hw_init(void) {
@@ -221,8 +209,170 @@ static void __attribute__((noinline)) hw_write_memory(uint16_t addr, uint8_t val
     // Writes to ROM are ignored
 }
 
+// Instruction decoding helpers
+struct instruction {
+    uint8_t opcode;
+    uint8_t length;    // Instruction length in bytes
+    const char *name;  // Instruction mnemonic (for debugging)
+};
 
-// Initialize LLVM and create translation context
+// Translation context with the necessary LLVM types for common operations
+struct translation_ctx {
+    LLVMContextRef ctx;
+    LLVMModuleRef module;
+    LLVMBuilderRef builder;
+    LLVMTypeRef cpu_state_type;
+    LLVMValueRef cpu_state_ptr;
+    LLVMValueRef current_function;
+    LLVMOrcLLJITBuilderRef jit_builder;
+    LLVMOrcLLJITRef jit;
+
+    // Common LLVM types we'll need
+    LLVMTypeRef i8_type;     // 8-bit integer
+    LLVMTypeRef i16_type;    // 16-bit integer
+    LLVMTypeRef void_type;   // void type
+    
+    // Memory access function types
+    LLVMTypeRef read_memory_type;   // uint8_t(uint16_t)
+    LLVMTypeRef write_memory_type;  // void(uint16_t, uint8_t)
+    
+    // Memory access function declarations
+    LLVMValueRef read_memory_fn;
+    LLVMValueRef write_memory_fn;
+};
+
+// Create LLVM function declarations for memory access
+static bool create_memory_interface(struct translation_ctx *ctx) {
+    // Create common types
+    ctx->i8_type = LLVMInt8TypeInContext(ctx->ctx);
+    ctx->i16_type = LLVMInt16TypeInContext(ctx->ctx);
+    ctx->void_type = LLVMVoidTypeInContext(ctx->ctx);
+    
+    // Create read_memory function type: uint8_t(uint16_t)
+    LLVMTypeRef read_params[] = { ctx->i16_type };
+    ctx->read_memory_type = LLVMFunctionType(ctx->i8_type, read_params, 1, false);
+    
+    // Create write_memory function type: void(uint16_t, uint8_t)
+    LLVMTypeRef write_params[] = { ctx->i16_type, ctx->i8_type };
+    ctx->write_memory_type = LLVMFunctionType(ctx->void_type, write_params, 2, false);
+    
+    // Declare the functions in the module
+    ctx->read_memory_fn = LLVMAddFunction(ctx->module, "hw_read_memory", 
+                                        ctx->read_memory_type);
+    ctx->write_memory_fn = LLVMAddFunction(ctx->module, "hw_write_memory", 
+                                         ctx->write_memory_type);
+    
+    return true;
+}
+
+// Simple instruction decoder for initial testing
+static struct instruction decode_instruction(const uint8_t *code) {
+    struct instruction inst = {0};
+    inst.opcode = code[0];
+    inst.length = 1;  // Default length, will be adjusted
+
+    switch (code[0]) {
+        case 0x00:  // NOP
+            inst.name = "NOP";
+            break;
+        case 0x3E:  // LD A,d8
+            inst.name = "LD A,d8";
+            inst.length = 2;
+            break;
+        case 0x06:  // LD B,d8
+            inst.name = "LD B,d8";
+            inst.length = 2;
+            break;
+        case 0xFA:  // LD A,(a16)
+            inst.name = "LD A,(a16)";
+            inst.length = 3;
+            break;
+        case 0xEA:  // LD (a16),A
+            inst.name = "LD (a16),A";
+            inst.length = 3;
+            break;
+        case 0xC3:  // JP a16
+            inst.name = "JP a16";
+            inst.length = 3;
+            break;
+        default:
+            inst.name = "Unknown";
+            break;
+    }
+    return inst;
+}
+
+// Generate LLVM IR for loading a register with an immediate value
+static bool translate_ld_r_d8(struct translation_ctx *ctx, uint8_t reg_idx, uint8_t value) {
+    // Get pointer to register in CPU state
+    LLVMValueRef reg_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type, 
+                                              ctx->cpu_state_ptr, reg_idx, "reg_ptr");
+    // Store immediate value
+    LLVMValueRef imm = LLVMConstInt(ctx->i8_type, value, false);
+    LLVMBuildStore(ctx->builder, imm, reg_ptr);
+    return true;
+}
+
+// Generate LLVM IR for loading A from memory
+static bool translate_ld_a_mem(struct translation_ctx *ctx, uint16_t addr) {
+    // Create call to read_memory(addr)
+    LLVMValueRef args[] = { LLVMConstInt(ctx->i16_type, addr, false) };
+    LLVMValueRef value = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                       ctx->read_memory_fn, args, 1, "mem_value");
+    
+    // Store result in A register
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMBuildStore(ctx->builder, value, a_ptr);
+    return true;
+}
+
+// Generate LLVM IR for storing A to memory
+static bool translate_ld_mem_a(struct translation_ctx *ctx, uint16_t addr) {
+    // Load A register value
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                            ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a_val = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a_val");
+    
+    // Create call to write_memory(addr, a_val)
+    LLVMValueRef args[] = {
+        LLVMConstInt(ctx->i16_type, addr, false),
+        a_val
+    };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type, 
+                   ctx->write_memory_fn, args, 2, "");
+    return true;
+}
+
+// Translate a single instruction to LLVM IR
+static bool translate_instruction(struct translation_ctx *ctx, 
+                                const struct instruction *inst,
+                                const uint8_t *code) {
+    switch (inst->opcode) {
+        case 0x00:  // NOP
+            return true;
+        
+        case 0x3E:  // LD A,d8
+            return translate_ld_r_d8(ctx, 0, code[1]);  // A is at index 0
+        
+        case 0x06:  // LD B,d8
+            return translate_ld_r_d8(ctx, 2, code[1]);  // B is at index 2
+        
+        case 0xFA: { // LD A,(a16)
+            uint16_t addr = code[1] | (code[2] << 8);
+            return translate_ld_a_mem(ctx, addr);
+        }
+        
+        case 0xEA: { // LD (a16),A
+            uint16_t addr = code[1] | (code[2] << 8);
+            return translate_ld_mem_a(ctx, addr);
+        }
+    }
+    
+    fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);
+    return false;
+}
+
 static bool init_translation(struct translation_ctx *ctx) {
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
@@ -243,24 +393,27 @@ static bool init_translation(struct translation_ctx *ctx) {
         return false;
     }
 
-    // Get the context - will be owned by the JIT
     ctx->ctx = LLVMContextCreate();
     if (!ctx->ctx) {
         fprintf(stderr, "Failed to create LLVM context\n");
         return false;
     }
 
-    // Create module within this context
     ctx->module = LLVMModuleCreateWithNameInContext("gb_code", ctx->ctx);
     if (!ctx->module) {
         fprintf(stderr, "Failed to create LLVM module\n");
         return false;
     }
 
-    // Create IR builder
     ctx->builder = LLVMCreateBuilderInContext(ctx->ctx);
     if (!ctx->builder) {
         fprintf(stderr, "Failed to create LLVM IR builder\n");
+        return false;
+    }
+
+    // Create memory interface
+    if (!create_memory_interface(ctx)) {
+        fprintf(stderr, "Failed to create memory interface\n");
         return false;
     }
 
@@ -284,9 +437,16 @@ int main(int argc, char *argv[]) {
 
     hw_init();
 
+    if (!load_rom(argv[1])) {
+        fprintf(stderr, "Failed to load ROM\n");
+        hw_cleanup();
+        return 1;
+    }
+
     struct translation_ctx ctx = {0};
     if (!init_translation(&ctx)) {
         fprintf(stderr, "Failed to initialize translation\n");
+        hw_cleanup();
         return 1;
     }
 

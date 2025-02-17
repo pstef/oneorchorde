@@ -441,6 +441,18 @@ static struct instruction decode_instruction(const uint8_t *code) {
             inst.name = "JR Z,r8";
             inst.length = 2;
             break;
+        case 0xC1: // POP BC
+            inst.name = "POP BC";
+            break;
+        case 0xD1: // POP DE
+            inst.name = "POP DE";
+            break;
+        case 0xE1: // POP HL
+            inst.name = "POP HL";
+            break;
+        case 0xF1: // POP AF
+            inst.name = "POP AF";
+            break;
         default:
             inst.name = "Unknown";
             break;
@@ -703,6 +715,50 @@ static bool translate_push_rr(struct translation_ctx *ctx, int hi_idx, int lo_id
     return true;
 }
 
+static bool translate_pop_rr(struct translation_ctx *ctx, int hi_idx, int lo_idx) {
+    // Load SP
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMValueRef sp = LLVMBuildLoad2(ctx->builder, ctx->i16_type, sp_ptr, "sp");
+    
+    // Read low byte first
+    LLVMValueRef args1[] = { sp };
+    LLVMValueRef lo = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                    ctx->read_memory_fn, args1, 1, "lo");
+    
+    // Increment SP and read high byte
+    LLVMValueRef new_sp = LLVMBuildAdd(ctx->builder, sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_inc");
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    LLVMValueRef args2[] = { new_sp };
+    LLVMValueRef hi = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                    ctx->read_memory_fn, args2, 1, "hi");
+    
+    // Increment SP again
+    new_sp = LLVMBuildAdd(ctx->builder, new_sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_inc2");
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    
+    // Store values in registers
+    LLVMValueRef hi_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, hi_idx, "hi_ptr");
+    LLVMValueRef lo_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, lo_idx, "lo_ptr");
+    
+    // For AF pair, mask F register value
+    if (hi_idx == 0 && lo_idx == 1) {  // AF pair
+        // Only bits 7-4 of F are used
+        lo = LLVMBuildAnd(ctx->builder, lo,
+            LLVMConstInt(ctx->i8_type, 0xF0, false), "f_masked");
+    }
+    
+    LLVMBuildStore(ctx->builder, hi, hi_ptr);
+    LLVMBuildStore(ctx->builder, lo, lo_ptr);
+    
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -756,6 +812,14 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_push_rr(ctx, 6, 7);  // H = 6, L = 7
         case 0xF5:  // PUSH AF
             return translate_push_rr(ctx, 0, 1);  // A = 0, F = 1
+        case 0xC1:  // POP BC
+            return translate_pop_rr(ctx, 2, 3);  // B = 2, C = 3
+        case 0xD1:  // POP DE
+            return translate_pop_rr(ctx, 4, 5);  // D = 4, E = 5
+        case 0xE1:  // POP HL
+            return translate_pop_rr(ctx, 6, 7);  // H = 6, L = 7
+        case 0xF1:  // POP AF
+            return translate_pop_rr(ctx, 0, 1);  // A = 0, F = 1
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);
@@ -865,7 +929,7 @@ static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
         struct instruction inst = decode_instruction(&hw_state.rom_data[pc]);
         
         if (strcmp(inst.name, "Unknown") == 0) {
-            printf("Stopping at unknown instruction at 0x%04X\n", pc);
+            printf("Stopping at unknown instruction 0x%02X at 0x%04X\n", inst.opcode, pc);
             break;
         }
         

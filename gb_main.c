@@ -619,7 +619,6 @@ struct translation_ctx {
     LLVMTypeRef cpu_state_type;
     LLVMValueRef cpu_state_ptr;
     LLVMValueRef current_function;
-    LLVMOrcLLJITBuilderRef jit_builder;
     LLVMOrcLLJITRef jit;
     LLVMOrcThreadSafeContextRef tsctx;  // Add this
 
@@ -1881,19 +1880,13 @@ static bool translate_instruction(struct translation_ctx *ctx,
     return false;
 }
 
+// We create a thread-safe context (tsctx) here so we can wrap our module.
 static bool init_translation(struct translation_ctx *ctx) {
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
     
-    // Create JIT builder
-    ctx->jit_builder = LLVMOrcCreateLLJITBuilder();
-    if (!ctx->jit_builder) {
-        fprintf(stderr, "Failed to create LLJIT builder\n");
-        return false;
-    }
-
-    // Create JIT instance
-    LLVMErrorRef err = LLVMOrcCreateLLJIT(&ctx->jit, ctx->jit_builder);
+    // Create the ORC JIT.
+    LLVMErrorRef err = LLVMOrcCreateLLJIT(&ctx->jit, NULL);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "Failed to create LLJIT: %s\n", msg);
@@ -1901,12 +1894,16 @@ static bool init_translation(struct translation_ctx *ctx) {
         return false;
     }
 
+    // Create a thread-safe context from the new, plain LLVM context.
     ctx->ctx = LLVMContextCreate();
     if (!ctx->ctx) {
         fprintf(stderr, "Failed to create LLVM context\n");
         return false;
     }
 
+    ctx->tsctx = LLVMOrcCreateNewThreadSafeContext();
+
+    // Create module and builder.
     ctx->module = LLVMModuleCreateWithNameInContext("gb_code", ctx->ctx);
     if (!ctx->module) {
         fprintf(stderr, "Failed to create LLVM module\n");
@@ -1938,7 +1935,11 @@ static void cleanup_translation(struct translation_ctx *ctx) {
     if (ctx->tsctx) {
         LLVMOrcDisposeThreadSafeContext(ctx->tsctx);
     }
+    if (ctx->ctx) {
+        LLVMContextDispose(ctx->ctx);
+    }
 }
+
 // Function type for our translated code
 typedef void (*gb_main_fn)(struct gb_cpu_state*);
 
@@ -1964,9 +1965,16 @@ static bool create_translated_function(struct translation_ctx *ctx) {
     // Store CPU state pointer
     ctx->cpu_state_ptr = LLVMGetParam(ctx->current_function, 0);
     
+    // For now, generate a simple "return" instruction.
+    LLVMBuildRetVoid(ctx->builder);
+
     return true;
 }
 
+// Test translation and run the translated function.
+// Note: Even though we don't need full thread safety in our translation,
+// LLVM ORC still requires that modules be wrapped as a thread-safe module.
+typedef void (*gb_main_fn)(struct gb_cpu_state*);
 static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
     // Create main function for translated code
     if (!create_translated_function(ctx)) {
@@ -1998,15 +2006,12 @@ static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
         pc += inst.length;
     }
     
-    // Add return instruction
-    LLVMBuildRetVoid(ctx->builder);
-    
     // Verify the generated code
     char *error = NULL;
     if (LLVMVerifyModule(ctx->module, LLVMPrintMessageAction, &error) != 0) {
-        fprintf(stderr, "Module verification failed\n");
+        fprintf(stderr, "Module verification failed: %s\n", error);
         LLVMDisposeMessage(error);
-        return false;
+        return NULL;
     }
     
     // Print generated IR for inspection
@@ -2014,20 +2019,13 @@ static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
     printf("\nGenerated LLVM IR:\n%s\n", ir);
     LLVMDisposeMessage(ir);
     
-    // Create thread-safe module for JIT
-    LLVMOrcThreadSafeContextRef tsctx = LLVMOrcCreateNewThreadSafeContext();
-    if (!tsctx) {
-        fprintf(stderr, "Failed to create thread-safe context\n");
-        return false;
-    }
-    
-    // Create thread-safe module - only takes module and context
+    // Create a thread-safe module from our module and thread-safe context.
     LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(
-        ctx->module, tsctx);
+        ctx->module, ctx->tsctx);
     if (!tsm) {
         fprintf(stderr, "Failed to create thread-safe module\n");
-        LLVMOrcDisposeThreadSafeContext(tsctx);
-        return false;
+        LLVMOrcDisposeThreadSafeContext(ctx->tsctx);
+        return NULL;
     }
     
     // Add module to JIT
@@ -2037,9 +2035,7 @@ static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "Failed to add module to JIT: %s\n", msg);
         LLVMDisposeErrorMessage(msg);
-        LLVMOrcDisposeThreadSafeModule(tsm);
-        LLVMOrcDisposeThreadSafeContext(tsctx);
-        return false;
+        return NULL;
     }
     
     // Look up the generated function

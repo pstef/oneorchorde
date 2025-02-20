@@ -357,6 +357,8 @@ Important Notes:
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
 
+#define MAX_JUMP_TARGETS 1024
+
 // GameBoy ROM header starts at 0x100
 #define ROM_HEADER_START 0x100
 #define ROM_HEADER_SIZE 0x50
@@ -611,6 +613,12 @@ struct instruction {
     const char *name;  // Instruction mnemonic (for debugging)
 };
 
+// For Control Flow
+struct jump_mapping {
+    uint16_t addr;
+    LLVMBasicBlockRef block;
+};
+
 // Translation context with the necessary LLVM types for common operations
 struct translation_ctx {
     LLVMContextRef ctx;
@@ -634,6 +642,9 @@ struct translation_ctx {
     // Memory access function declarations
     LLVMValueRef read_memory_fn;
     LLVMValueRef write_memory_fn;
+
+    struct jump_mapping jump_targets[MAX_JUMP_TARGETS];
+    int jump_target_count;
 };
 
 // Create LLVM function declarations for memory access
@@ -964,18 +975,27 @@ static bool translate_ld_hl_dec_a(struct translation_ctx *ctx) {
     return true;
 }
 
-static bool translate_jp_a16(struct translation_ctx *ctx, uint16_t addr) {
-    // Create a new basic block for the jump target
+// New helper function to support jump mapping.
+static LLVMBasicBlockRef get_or_create_jump_target(struct translation_ctx *ctx, uint16_t addr) {
+    for (int i = 0; i < ctx->jump_target_count; i++) {
+        if (ctx->jump_targets[i].addr == addr)
+            return ctx->jump_targets[i].block;
+    }
     char block_name[32];
     snprintf(block_name, sizeof(block_name), "addr_%04X", addr);
-    LLVMBasicBlockRef target_block = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    LLVMBasicBlockRef new_bb = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    if (ctx->jump_target_count < MAX_JUMP_TARGETS) {
+        ctx->jump_targets[ctx->jump_target_count].addr = addr;
+        ctx->jump_targets[ctx->jump_target_count].block = new_bb;
+        ctx->jump_target_count++;
+    }
+    return new_bb;
+}
 
-    // Jump to the target block
+static bool translate_jp_a16(struct translation_ctx *ctx, uint16_t addr) {
+    LLVMBasicBlockRef target_block = get_or_create_jump_target(ctx, addr);
     LLVMBuildBr(ctx->builder, target_block);
-
-    // Position builder at the new block
     LLVMPositionBuilderAtEnd(ctx->builder, target_block);
-
     return true;
 }
 

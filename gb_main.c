@@ -848,6 +848,9 @@ static struct instruction decode_instruction(const uint8_t *code) {
         case 0xFF: // RST 38H
             inst.name = "RST 38H";
             break;
+        case 0xD9:
+            inst.name = "RETI";
+            break;
         case 0x82: // ADD A,D
             inst.name = "ADD A,D";
             break;
@@ -1035,10 +1038,27 @@ static bool translate_jp_cc_nn(struct translation_ctx *ctx, LLVMValueRef cond, u
     return true;
 }
 
+// Look up or create a basic block for a given ROM address.
+static LLVMBasicBlockRef get_or_create_basic_block(struct translation_ctx *ctx, uint16_t addr) {
+    for (int i = 0; i < ctx->jump_target_count; i++) {
+        if (ctx->jump_targets[i].addr == addr)
+            return ctx->jump_targets[i].block;
+    }
+    char block_name[32];
+    snprintf(block_name, sizeof(block_name), "addr_%04X", addr);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    if (ctx->jump_target_count < MAX_JUMP_TARGETS) {
+        ctx->jump_targets[ctx->jump_target_count].addr = addr;
+        ctx->jump_targets[ctx->jump_target_count].block = bb;
+        ctx->jump_target_count++;
+    }
+    return bb;
+}
+
 // Unconditional relative jump: JR e
 // 'target_addr' is the absolute address of the destination precomputed from the current PC plus offset.
 static bool translate_jr_e(struct translation_ctx *ctx, int16_t target_addr) {
-    LLVMBasicBlockRef target_bb = get_or_create_jump_target(ctx, target_addr);
+    LLVMBasicBlockRef target_bb = get_or_create_basic_block(ctx, target_addr);
     LLVMBuildBr(ctx->builder, target_bb);
     LLVMPositionBuilderAtEnd(ctx->builder, target_bb);
     return true;
@@ -1046,7 +1066,7 @@ static bool translate_jr_e(struct translation_ctx *ctx, int16_t target_addr) {
 
 // Conditional relative jump: JR cc,e
 static bool translate_jr_cc_e(struct translation_ctx *ctx, LLVMValueRef cond, int16_t target_addr) {
-    LLVMBasicBlockRef jump_bb = get_or_create_jump_target(ctx, target_addr);
+    LLVMBasicBlockRef jump_bb = get_or_create_basic_block(ctx, target_addr);
     LLVMBasicBlockRef fallthrough_bb = LLVMAppendBasicBlock(ctx->current_function, "jr_cc_e_fallthrough");
     LLVMBuildCondBr(ctx->builder, cond, jump_bb, fallthrough_bb);
     LLVMPositionBuilderAtEnd(ctx->builder, fallthrough_bb);
@@ -1825,6 +1845,35 @@ static bool translate_adc_n(struct translation_ctx *ctx, uint8_t n) {
     return true;
 }
 
+// Semantically similar to RET. Here we would enable interrupts if needed.
+static bool translate_reti(struct translation_ctx *ctx) {
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                              ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMValueRef sp = LLVMBuildLoad2(ctx->builder, ctx->i16_type, sp_ptr, "sp");
+    LLVMValueRef args1[] = { sp };
+    LLVMValueRef pcl = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                       ctx->read_memory_fn, args1, 1, "pcl");
+    LLVMValueRef new_sp = LLVMBuildAdd(ctx->builder, sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_inc");
+    LLVMValueRef args2[] = { new_sp };
+    LLVMValueRef pch = LLVMBuildCall2(ctx->builder, ctx->read_memory_type,
+                                       ctx->read_memory_fn, args2, 1, "pch");
+    new_sp = LLVMBuildAdd(ctx->builder, new_sp,
+        LLVMConstInt(ctx->i16_type, 1, false), "sp_inc2");
+    LLVMBuildStore(ctx->builder, new_sp, sp_ptr);
+    LLVMValueRef ret_addr = LLVMBuildOr(ctx->builder,
+        LLVMBuildShl(ctx->builder, pch, LLVMConstInt(ctx->i16_type, 8, false), "pch_shifted"),
+        LLVMBuildZExt(ctx->builder, pcl, ctx->i16_type, "pcl_ext"),
+        "ret_addr");
+    char block_name[32];
+    snprintf(block_name, sizeof(block_name), "reti_%04X", 0);
+    LLVMBasicBlockRef target_block = LLVMAppendBasicBlock(ctx->current_function, block_name);
+    LLVMBuildBr(ctx->builder, target_block);
+    LLVMPositionBuilderAtEnd(ctx->builder, target_block);
+    // Here interrupts would be re-enabled. (Placeholder.)
+    return true;
+}
+
 // Translate a single instruction to LLVM IR
 static bool translate_instruction(struct translation_ctx *ctx, 
                                 const struct instruction *inst,
@@ -1886,6 +1935,8 @@ static bool translate_instruction(struct translation_ctx *ctx,
             return translate_ret(ctx, true, true);
         case 0xC9:  // RET
             return translate_ret(ctx, false, false);
+        case 0xD9:  // RETI
+            return translate_reti(ctx);
         case 0xC4:  // CALL NZ,a16
             return translate_call(ctx, code, true, false);
         case 0xCC:  // CALL Z,a16
@@ -2149,23 +2200,6 @@ static gb_main_fn test_translation_and_run(struct translation_ctx *ctx) {
     
     // Cast address to function pointer and return it
     return (gb_main_fn)(intptr_t)addr;
-}
-
-// Look up or create a basic block for a given ROM address.
-static LLVMBasicBlockRef get_or_create_basic_block(struct translation_ctx *ctx, uint16_t addr) {
-    for (int i = 0; i < ctx->jump_target_count; i++) {
-        if (ctx->jump_targets[i].addr == addr)
-            return ctx->jump_targets[i].block;
-    }
-    char block_name[32];
-    snprintf(block_name, sizeof(block_name), "addr_%04X", addr);
-    LLVMBasicBlockRef bb = LLVMAppendBasicBlock(ctx->current_function, block_name);
-    if (ctx->jump_target_count < MAX_JUMP_TARGETS) {
-        ctx->jump_targets[ctx->jump_target_count].addr = addr;
-        ctx->jump_targets[ctx->jump_target_count].block = bb;
-        ctx->jump_target_count++;
-    }
-    return bb;
 }
 
 // A simple worklist-based CFG builder during translation.

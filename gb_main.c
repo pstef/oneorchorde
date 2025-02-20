@@ -941,11 +941,91 @@ static struct instruction decode_instruction(const uint8_t *code) {
             inst.name = "JR NZ,e";
             inst.length = 2;
             break;
+        case 0x0E:
+            inst.name = "LD C,d8";
+            inst.length = 2;
+            break;
+        case 0x31:
+            inst.name = "LD SP,d16";
+            inst.length = 3;
+            break;
+        case 0x38:
+            inst.name = "JR C,e";
+            inst.length = 2;
+            break;
+        case 0x1F:
+            inst.name = "RRA";
+            break;
+        case 0x3F:
+            inst.name = "CCF";
+            break;
+        case 0xE2:
+            inst.name = "LD (C),A";
+            break;
         default:
             inst.name = "Unknown";
             break;
     }
     return inst;
+}
+
+// LD SP,d16: Loads a 16-bit immediate value into the stack pointer.
+bool translate_ld_sp_d16(struct translation_ctx *ctx, uint16_t value) {
+    LLVMValueRef sp_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                              ctx->cpu_state_ptr, 8, "sp_ptr");
+    LLVMBuildStore(ctx->builder, LLVMConstInt(ctx->i16_type, value, false), sp_ptr);
+    return true;
+}
+
+static LLVMValueRef get_flag_c(struct translation_ctx *ctx) {
+    // Get F register
+    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                           ctx->cpu_state_ptr, 1, "f_ptr");
+    LLVMValueRef f = LLVMBuildLoad2(ctx->builder, ctx->i8_type, f_ptr, "f");
+    
+    // Extract C flag (bit 4) and shift it to bit 0
+    LLVMValueRef c = LLVMBuildLShr(ctx->builder, f,
+        LLVMConstInt(ctx->i8_type, 4, false), "c_shifted");
+    return LLVMBuildAnd(ctx->builder, c,
+        LLVMConstInt(ctx->i8_type, 0x01, false), "c_flag");
+}
+
+// RRA: Rotate register A right through the carry flag.
+bool translate_rra(struct translation_ctx *ctx) {
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a");
+    LLVMValueRef c = get_flag_c(ctx);
+    LLVMValueRef c_shifted = LLVMBuildShl(ctx->builder, c, LLVMConstInt(ctx->i8_type, 7, false), "c_shifted");
+    LLVMValueRef a_shifted = LLVMBuildLShr(ctx->builder, a, LLVMConstInt(ctx->i8_type, 1, false), "a_shifted");
+    LLVMValueRef newA = LLVMBuildOr(ctx->builder, c_shifted, a_shifted, "newA");
+    LLVMBuildStore(ctx->builder, newA, a_ptr);
+    return true;
+}
+
+// CCF: Complement (toggle) the carry flag in register F.
+bool translate_ccf(struct translation_ctx *ctx) {
+    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 1, "f_ptr");
+    LLVMValueRef f = LLVMBuildLoad2(ctx->builder, ctx->i8_type, f_ptr, "f");
+    LLVMValueRef new_f = LLVMBuildXor(ctx->builder, f, LLVMConstInt(ctx->i8_type, 0x10, false), "toggle_carry");
+    LLVMBuildStore(ctx->builder, new_f, f_ptr);
+    return true;
+}
+
+// LD (C),A: Store the value in A into memory at address 0xFF00+C.
+bool translate_ld_at_C_a(struct translation_ctx *ctx) {
+    LLVMValueRef c_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 3, "c_ptr"); // Register C is at index 3.
+    LLVMValueRef c_val = LLVMBuildLoad2(ctx->builder, ctx->i8_type, c_ptr, "c_val");
+    LLVMValueRef c_ext = LLVMBuildZExt(ctx->builder, c_val, ctx->i16_type, "c_ext");
+    LLVMValueRef addr = LLVMBuildAdd(ctx->builder, LLVMConstInt(ctx->i16_type, 0xFF00, false), c_ext, "addr");
+    LLVMValueRef a_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
+                                             ctx->cpu_state_ptr, 0, "a_ptr");
+    LLVMValueRef a_val = LLVMBuildLoad2(ctx->builder, ctx->i8_type, a_ptr, "a_val");
+    LLVMValueRef args[] = { addr, a_val };
+    LLVMBuildCall2(ctx->builder, ctx->write_memory_type, ctx->write_memory_fn, args, 2, "");
+    return true;
 }
 
 static bool translate_xor_a(struct translation_ctx *ctx) {
@@ -1533,19 +1613,6 @@ static bool translate_rst(struct translation_ctx *ctx, uint8_t vector) {
     return true;
 }
 
-static LLVMValueRef get_flag_c(struct translation_ctx *ctx) {
-    // Get F register
-    LLVMValueRef f_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type,
-                                           ctx->cpu_state_ptr, 1, "f_ptr");
-    LLVMValueRef f = LLVMBuildLoad2(ctx->builder, ctx->i8_type, f_ptr, "f");
-    
-    // Extract C flag (bit 4) and shift it to bit 0
-    LLVMValueRef c = LLVMBuildLShr(ctx->builder, f,
-        LLVMConstInt(ctx->i8_type, 4, false), "c_shifted");
-    return LLVMBuildAnd(ctx->builder, c,
-        LLVMConstInt(ctx->i8_type, 0x01, false), "c_flag");
-}
-
 static void update_flags_add(struct translation_ctx *ctx, LLVMValueRef result, 
                            LLVMValueRef a, LLVMValueRef b, LLVMValueRef carry) {
     // Get F register pointer
@@ -2024,6 +2091,22 @@ static bool translate_instruction(struct translation_ctx *ctx,
             LLVMValueRef cond_true = LLVMConstInt(LLVMInt1TypeInContext(ctx->ctx), 1, false);
             return translate_jr_cc_e(ctx, cond_true, target);
         }
+        case 0x0E:  // LD C,d8
+            // Register C is at index 3 in the CPU state.
+            return translate_ld_r_d8(ctx, 3, code[1]);
+        case 0x31:  // LD SP,d16
+            return translate_ld_sp_d16(ctx, code[1] | (code[2] << 8));
+        case 0x38: { // JR C,e
+            int8_t offset = (int8_t)code[1];
+            int16_t target = 0x0400; // Dummy target address; replace with proper calculation.
+            return translate_jr_cc_e(ctx, get_flag_c(ctx), target);
+        }
+        case 0x1F:  // RRA
+            return translate_rra(ctx);
+        case 0x3F:  // CCF
+            return translate_ccf(ctx);
+        case 0xE2:  // LD (C),A
+            return translate_ld_at_C_a(ctx);
     }
 
     fprintf(stderr, "Unhandled opcode: 0x%02X\n", inst->opcode);

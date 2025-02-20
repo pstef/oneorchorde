@@ -992,6 +992,55 @@ static LLVMBasicBlockRef get_or_create_jump_target(struct translation_ctx *ctx, 
     return new_bb;
 }
 
+
+// Unconditional absolute jump: JP nn
+static bool translate_jp_nn(struct translation_ctx *ctx, uint16_t addr) {
+    LLVMBasicBlockRef target_block = get_or_create_jump_target(ctx, addr);
+    LLVMBuildBr(ctx->builder, target_block);
+    LLVMPositionBuilderAtEnd(ctx->builder, target_block);
+    return true;
+}
+
+// Indirect jump using HL register: JP HL
+// (Stub implementation: proper computed branch would require using 'indirectbr')
+static bool translate_jp_hl(struct translation_ctx *ctx) {
+    LLVMValueRef hl_ptr = LLVMBuildStructGEP2(ctx->builder, ctx->cpu_state_type, ctx->cpu_state_ptr, 6, "hl_ptr");
+    LLVMValueRef hl_val = LLVMBuildLoad2(ctx->builder, ctx->i16_type, hl_ptr, "hl_val");
+    // For demonstration, use an indirect branch with one fallback destination.
+    // In a full implementation, possible targets would be enumerated.
+    LLVMBasicBlockRef default_bb = get_or_create_jump_target(ctx, 0x0000);
+    LLVMBuildIndirectBr(ctx->builder, hl_val, 1);
+    LLVMPositionBuilderAtEnd(ctx->builder, default_bb);
+    return true;
+}
+
+// Conditional absolute jump: JP cc,nn. 'cond' is a value (i1 or i8) representing the condition.
+static bool translate_jp_cc_nn(struct translation_ctx *ctx, LLVMValueRef cond, uint16_t addr) {
+    LLVMBasicBlockRef jump_bb = get_or_create_jump_target(ctx, addr);
+    LLVMBasicBlockRef fallthrough_bb = LLVMAppendBasicBlock(ctx->current_function, "jp_cc_nn_fallthrough");
+    LLVMBuildCondBr(ctx->builder, cond, jump_bb, fallthrough_bb);
+    LLVMPositionBuilderAtEnd(ctx->builder, fallthrough_bb);
+    return true;
+}
+
+// Unconditional relative jump: JR e
+// 'target_addr' is the absolute address of the destination precomputed from the current PC plus offset.
+static bool translate_jr_e(struct translation_ctx *ctx, int16_t target_addr) {
+    LLVMBasicBlockRef target_bb = get_or_create_jump_target(ctx, target_addr);
+    LLVMBuildBr(ctx->builder, target_bb);
+    LLVMPositionBuilderAtEnd(ctx->builder, target_bb);
+    return true;
+}
+
+// Conditional relative jump: JR cc,e
+static bool translate_jr_cc_e(struct translation_ctx *ctx, LLVMValueRef cond, int16_t target_addr) {
+    LLVMBasicBlockRef jump_bb = get_or_create_jump_target(ctx, target_addr);
+    LLVMBasicBlockRef fallthrough_bb = LLVMAppendBasicBlock(ctx->current_function, "jr_cc_e_fallthrough");
+    LLVMBuildCondBr(ctx->builder, cond, jump_bb, fallthrough_bb);
+    LLVMPositionBuilderAtEnd(ctx->builder, fallthrough_bb);
+    return true;
+}
+
 static bool translate_jp_a16(struct translation_ctx *ctx, uint16_t addr) {
     LLVMBasicBlockRef target_block = get_or_create_jump_target(ctx, addr);
     LLVMBuildBr(ctx->builder, target_block);
